@@ -14,8 +14,6 @@ import "@openzeppelin/contracts/token/ERC1155/utils/ERC1155Holder.sol";
  *         Any registered SwapPool can push fees in; only owner can pull out.
  */
 contract FeeCollector is Ownable, ERC1155Holder {
-    // Pools authorised to deposit fees
-    mapping(address => bool) public authorisedPools;
 
     event FeeReceived(
         address indexed pool,
@@ -37,23 +35,6 @@ contract FeeCollector is Ownable, ERC1155Holder {
 
     constructor(address owner_) Ownable(owner_) {}
 
-    modifier onlyPool() {
-        if (!authorisedPools[msg.sender]) revert NotAuthorisedPool();
-        _;
-    }
-
-    // ─── Admin ────────────────────────────────────────────────────────────────
-
-    function authorisePool(address pool) external onlyOwner {
-        authorisedPools[pool] = true;
-        emit PoolAuthorised(pool);
-    }
-
-    function revokePool(address pool) external onlyOwner {
-        authorisedPools[pool] = false;
-        emit PoolRevoked(pool);
-    }
-
     // ─── Fee receipt (called by SwapPool during swap) ─────────────────────────
 
     /**
@@ -66,7 +47,7 @@ contract FeeCollector is Ownable, ERC1155Holder {
         address token,
         uint256 tokenId,
         uint256 amount
-    ) external onlyPool {
+    ) external {
         if (amount == 0) revert ZeroAmount();
         emit FeeReceived(msg.sender, token, tokenId, amount);
     }
@@ -90,6 +71,31 @@ contract FeeCollector is Ownable, ERC1155Holder {
         uint256[] calldata amounts,
         address to
     ) external onlyOwner {
+        IERC1155(token).safeBatchTransferFrom(address(this), to, tokenIds, amounts, "");
+    }
+
+        /// @notice Withdraw the entire balance of a single token ID
+    function withdrawAll(
+        address token,
+        uint256 tokenId,
+        address to
+    ) external onlyOwner {
+        uint256 amount = IERC1155(token).balanceOf(address(this), tokenId);
+        if (amount == 0) revert ZeroAmount();
+        IERC1155(token).safeTransferFrom(address(this), to, tokenId, amount, "");
+        emit FeeWithdrawn(token, tokenId, amount, to);
+    }
+
+    /// @notice Withdraw the entire balance of multiple token IDs in one call
+    function withdrawAllBatch(
+        address token,
+        uint256[] calldata tokenIds,
+        address to
+    ) external onlyOwner {
+        uint256[] memory amounts = new uint256[](tokenIds.length);
+        for (uint256 i; i < tokenIds.length; i++) {
+            amounts[i] = IERC1155(token).balanceOf(address(this), tokenIds[i]);
+        }
         IERC1155(token).safeBatchTransferFrom(address(this), to, tokenIds, amounts, "");
     }
 }

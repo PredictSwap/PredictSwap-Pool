@@ -11,36 +11,49 @@ import "./FeeCollector.sol";
  * @notice Team-only factory that deploys SwapPool + LPToken pairs and serves
  *         as the on-chain registry of all active pools.
  *
- *         Each pool corresponds to one matched event-outcome pair:
- *         - One Polymarket ERC-1155 token ID on Polygon
- *         - One WrappedOpinion ERC-1155 token ID on Polygon
+ *         Both the Polymarket ERC-1155 contract and WrappedOpinionToken contract
+ *         are fixed at construction — only token IDs vary per pool.
  *
- *         Pool creation is permissioned (owner only) to ensure correct
- *         event matching. Permissionless creation planned for Phase 4.
+ *         Swap fees are global and configurable by owner, capped by hard limits.
+ *         All pools read fees from here at swap time.
  */
 contract PoolFactory is Ownable {
+
     // ─── Types ────────────────────────────────────────────────────────────────
 
     struct PoolInfo {
         address swapPool;
         address lpToken;
-        address polymarketToken;
         uint256 polymarketTokenId;
-        address opinionToken;
         uint256 opinionTokenId;
         uint256 resolutionDate;
         bool    isActive;
     }
 
-    // ─── State ────────────────────────────────────────────────────────────────
+    // ─── Immutable config ─────────────────────────────────────────────────────
 
+    /// @notice The single Polymarket ERC-1155 contract on Polygon
+    address public immutable polymarketToken;
+    /// @notice The single WrappedOpinionToken ERC-1155 contract on Polygon
+    address public immutable opinionToken;
+    /// @notice Protocol fee recipient
     FeeCollector public immutable feeCollector;
 
-    /// @notice All deployed pools
+    // ─── Configurable fees ────────────────────────────────────────────────────
+
+    uint256 public lpFeeBps       = 30;  // 0.30% default
+    uint256 public protocolFeeBps = 10;  // 0.10% default
+
+    uint256 public constant FEE_DENOMINATOR  = 10_000;
+    uint256 public constant MAX_LP_FEE       = 100;   // 1.00% hard cap
+    uint256 public constant MAX_PROTOCOL_FEE = 50;    // 0.50% hard cap
+
+    // ─── State ────────────────────────────────────────────────────────────────
+
     PoolInfo[] public pools;
 
-    /// @notice Lookup by (polymarketToken, polymarketTokenId, opinionToken, opinionTokenId) → poolId
-    mapping(bytes32 => uint256) public poolIndex; // 1-indexed; 0 = not found
+    /// @notice (polymarketTokenId, opinionTokenId) → poolId, 1-indexed; 0 = not found
+    mapping(bytes32 => uint256) public poolIndex;
 
     // ─── Events ───────────────────────────────────────────────────────────────
 
@@ -48,115 +61,112 @@ contract PoolFactory is Ownable {
         uint256 indexed poolId,
         address swapPool,
         address lpToken,
-        address polymarketToken,
         uint256 polymarketTokenId,
-        address opinionToken,
         uint256 opinionTokenId,
         uint256 resolutionDate
     );
     event PoolDeactivated(uint256 indexed poolId);
+    event FeesUpdated(uint256 lpFeeBps, uint256 protocolFeeBps);
 
     // ─── Errors ───────────────────────────────────────────────────────────────
 
     error PoolAlreadyExists(bytes32 key);
     error PoolNotFound(uint256 poolId);
     error InvalidAddress();
+    error FeeTooHigh();
 
     // ─── Constructor ──────────────────────────────────────────────────────────
 
-    constructor(address feeCollector_, address owner_) Ownable(owner_) {
-        if (feeCollector_ == address(0)) revert InvalidAddress();
-        feeCollector = FeeCollector(feeCollector_);
+    constructor(
+        address polymarketToken_,
+        address opinionToken_,
+        address feeCollector_,
+        address owner_
+    ) Ownable(owner_) {
+        if (polymarketToken_ == address(0) ||
+            opinionToken_    == address(0) ||
+            feeCollector_    == address(0)) revert InvalidAddress();
+
+        polymarketToken = polymarketToken_;
+        opinionToken    = opinionToken_;
+        feeCollector    = FeeCollector(feeCollector_);
+    }
+
+    // ─── Fee config ───────────────────────────────────────────────────────────
+
+    /**
+     * @notice Update swap fees. Changes take effect immediately for all pools.
+     * @param lpFeeBps_        New LP fee in basis points (max 100 = 1.00%)
+     * @param protocolFeeBps_  New protocol fee in basis points (max 50 = 0.50%)
+     */
+    function setFees(uint256 lpFeeBps_, uint256 protocolFeeBps_) external onlyOwner {
+        if (lpFeeBps_ > MAX_LP_FEE || protocolFeeBps_ > MAX_PROTOCOL_FEE) revert FeeTooHigh();
+        lpFeeBps       = lpFeeBps_;
+        protocolFeeBps = protocolFeeBps_;
+        emit FeesUpdated(lpFeeBps_, protocolFeeBps_);
+    }
+
+    /// @notice Total fee in basis points (LP + protocol)
+    function totalFeeBps() external view returns (uint256) {
+        return lpFeeBps + protocolFeeBps;
     }
 
     // ─── Pool creation ────────────────────────────────────────────────────────
 
     /**
      * @notice Deploy a new SwapPool + LPToken for a matched event-outcome pair.
-     *         Both tokens must already exist on Polygon:
-     *           - polymarketToken: native Polymarket ERC-1155
-     *           - opinionToken:    WrappedOpinionToken (bridged from BSC)
+     *         Only token IDs are needed — token contracts are fixed at construction.
      *
-     * @param polymarketToken_    Polymarket ERC-1155 contract
-     * @param polymarketTokenId_  Token ID on Polymarket contract
-     * @param opinionToken_       WrappedOpinionToken contract
-     * @param opinionTokenId_     Token ID on WrappedOpinionToken (mirrors BSC ID)
-     * @param resolutionDate_     Expected market resolution timestamp (informational)
-     * @param lpName              ERC-20 name for LP token  e.g. "PredictSwap BTC-YES LP"
-     * @param lpSymbol            ERC-20 symbol             e.g. "PS-BTC-YES"
+     * @param polymarketTokenId_  Token ID on the Polymarket ERC-1155 contract
+     * @param opinionTokenId_     Token ID on the WrappedOpinionToken contract
+     * @param resolutionDate_     Expected resolution timestamp (informational)
+     * @param lpName              ERC-20 name   e.g. "PredictSwap BTC-YES LP"
+     * @param lpSymbol            ERC-20 symbol e.g. "PS-BTC-YES"
      *
      * @return poolId  Zero-indexed pool ID
      */
     function createPool(
-        address polymarketToken_,
         uint256 polymarketTokenId_,
-        address opinionToken_,
         uint256 opinionTokenId_,
         uint256 resolutionDate_,
         string calldata lpName,
         string calldata lpSymbol
     ) external onlyOwner returns (uint256 poolId) {
-        if (polymarketToken_ == address(0) || opinionToken_ == address(0))
-            revert InvalidAddress();
-
-        bytes32 key = _poolKey(
-            polymarketToken_, polymarketTokenId_,
-            opinionToken_,    opinionTokenId_
-        );
+        bytes32 key = _poolKey(polymarketTokenId_, opinionTokenId_);
         if (poolIndex[key] != 0) revert PoolAlreadyExists(key);
 
-        // 1. Deploy LPToken with a temporary pool address (updated next step)
-        //    We use a two-step deploy because SwapPool needs the LP address,
-        //    and LPToken needs the SwapPool address. We pass the factory as
-        //    a temporary owner and reassign after SwapPool is deployed.
-        //
-        //    Alternative: deploy LPToken with address(this) as pool, then swap.
-        //    Here we compute the SwapPool address off-chain... but that's complex.
-        //    Simpler: deploy LP with this factory as pool, deploy SwapPool,
-        //    then deploy a thin LP wrapper. Instead we deploy LP with SwapPool
-        //    predictively using CREATE2.
-
-        // ── Two-step deploy (avoids CREATE2 chicken-and-egg) ─────────────
         // Step 1: Deploy LPToken with factory as temporary authority
         LPToken lp = new LPToken(lpName, lpSymbol, address(this));
-        address lpAddr = address(lp);
 
         // Step 2: Deploy SwapPool — LP address is now known
         SwapPool pool_ = new SwapPool(
-            polymarketToken_, polymarketTokenId_,
-            opinionToken_,    opinionTokenId_,
-            lpAddr,
+            address(this),
+            polymarketTokenId_,
+            opinionTokenId_,
+            address(lp),
             address(feeCollector)
         );
-        address poolAddr = address(pool_);
 
         // Step 3: Wire LP token to its SwapPool (one-time, irreversible)
-        lp.setPool(poolAddr);
-
-        // Authorise the new pool to report fees to FeeCollector
-        feeCollector.authorisePool(poolAddr);
+        lp.setPool(address(pool_));
 
         // Register
         poolId = pools.length;
         pools.push(PoolInfo({
-            swapPool:         poolAddr,
-            lpToken:          lpAddr,
-            polymarketToken:  polymarketToken_,
+            swapPool:          address(pool_),
+            lpToken:           address(lp),
             polymarketTokenId: polymarketTokenId_,
-            opinionToken:     opinionToken_,
-            opinionTokenId:   opinionTokenId_,
-            resolutionDate:   resolutionDate_,
-            isActive:         true
+            opinionTokenId:    opinionTokenId_,
+            resolutionDate:    resolutionDate_,
+            isActive:          true
         }));
-        poolIndex[key] = poolId + 1; // 1-indexed so 0 means "not found"
+        poolIndex[key] = poolId + 1;
 
         emit PoolCreated(
             poolId,
-            poolAddr,
-            lpAddr,
-            polymarketToken_,
+            address(pool_),
+            address(lp),
             polymarketTokenId_,
-            opinionToken_,
             opinionTokenId_,
             resolutionDate_
         );
@@ -191,16 +201,10 @@ contract PoolFactory is Ownable {
     }
 
     function findPool(
-        address polymarketToken_,
         uint256 polymarketTokenId_,
-        address opinionToken_,
         uint256 opinionTokenId_
     ) external view returns (bool found, uint256 poolId) {
-        bytes32 key = _poolKey(
-            polymarketToken_, polymarketTokenId_,
-            opinionToken_,    opinionTokenId_
-        );
-        uint256 idx = poolIndex[key];
+        uint256 idx = poolIndex[_poolKey(polymarketTokenId_, opinionTokenId_)];
         if (idx == 0) return (false, 0);
         return (true, idx - 1);
     }
@@ -215,53 +219,7 @@ contract PoolFactory is Ownable {
 
     // ─── Internal ─────────────────────────────────────────────────────────────
 
-    function _poolKey(
-        address polyToken, uint256 polyId,
-        address opToken,   uint256 opId
-    ) internal pure returns (bytes32) {
-        return keccak256(abi.encode(polyToken, polyId, opToken, opId));
-    }
-
-    /**
-     * @notice Predict the CREATE2 address for a SwapPool given a salt.
-     *         This is used to pre-wire the LP token to the correct pool address
-     *         before the pool is deployed.
-     */
-    function _predictSwapPoolAddress(bytes32 salt) internal view returns (address) {
-        // We don't know the exact bytecode yet at this point (it depends on LP address).
-        // This is the classic chicken-and-egg CREATE2 problem.
-        //
-        // Resolution: use a two-step deploy where LP is deployed with factory as
-        // temporary minter, then transferMintRole is called after SwapPool is deployed.
-        //
-        // See _createPoolTwoStep() below if you need this resolved cleanly.
-        // For now return address(0) as placeholder — see NOTE in createPool().
-        return address(0); // ← see two-step version below
+    function _poolKey(uint256 polyId, uint256 opId) internal pure returns (bytes32) {
+        return keccak256(abi.encode(polyId, opId));
     }
 }
-
-/*
- * NOTE ON CREATE2 CHICKEN-AND-EGG:
- *
- * The cleanest solution is a two-step LP deploy where the LP token accepts
- * a setPool(address) call that can only be called ONCE and only by the factory.
- * This avoids needing to predict addresses.
- *
- * Updated LPToken would look like:
- *
- *   address public pool;
- *   bool private poolSet;
- *
- *   function setPool(address pool_) external {
- *       require(!poolSet && msg.sender == factory);
- *       pool = pool_;
- *       poolSet = true;
- *   }
- *
- * Full production deployment flow:
- *   1. Deploy LPToken(name, symbol, factory_as_temp_pool)
- *   2. Deploy SwapPool(poly, polyId, op, opId, lpAddr, feeCollector)
- *   3. Call lpToken.setPool(swapPoolAddr)   ← one-time assignment
- *
- * This is simpler than CREATE2 address prediction and is recommended.
- */
