@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+pragma solidity ^0.8.24;
 
 import "forge-std/Script.sol";
 import "../../src/SwapPool.sol";
@@ -38,7 +38,6 @@ contract Swap is Script {
         SwapPool pool = SwapPool(info.swapPool);
 
         SwapPool.Side fromSide = SwapPool.Side(sideRaw);
-        SwapPool.Side toSide = fromSide == SwapPool.Side.POLYMARKET ? SwapPool.Side.OPINION : SwapPool.Side.POLYMARKET;
 
         address fromToken = fromSide == SwapPool.Side.POLYMARKET ? factory.polymarketToken() : factory.opinionToken();
         address toToken = fromSide == SwapPool.Side.POLYMARKET ? factory.opinionToken() : factory.polymarketToken();

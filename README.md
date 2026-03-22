@@ -90,7 +90,7 @@ All deploy scripts require environment variables to be loaded first:
 source .env
 ```
 
-### 1. Deploy Mock Polymarket Token (testnet only)
+### 1. Deploy and mint Dummy Mock Polymarket Token (testnet only)
 
 ```bash
 forge script script/integration_tests/DeployMockPoly.s.sol:DeployMockPolymarket \
@@ -103,15 +103,15 @@ forge script script/integration_tests/DeployMockPoly.s.sol:DeployMockPolymarket 
   -vvvv
 ```
 
-### 2. Mint Mock Tokens (testnet only)
-
 ```bash
 forge script script/integration_tests/MintMock.s.sol \
   --rpc-url $POLYGON_RPC_URL \
   --broadcast
 ```
 
-### 3. Deploy FeeCollector + PoolFactory
+add POLY_TOKEN_ID and OPINION_TOKEN_ID into .env
+
+### 2. Deploy FeeCollector + PoolFactory
 
 ```bash
 forge script script/Deploy.s.sol \
@@ -124,7 +124,9 @@ forge script script/Deploy.s.sol \
   -vvvv
 ```
 
-### 4. Create a Pool
+add FEE_COLLECTOR_ADDRESS and POOL_FACTORY_ADDRESS into .env
+
+### 3. Create a Pool
 
 ```bash
 forge script script/CreatePool.s.sol \

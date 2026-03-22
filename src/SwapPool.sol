@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+pragma solidity ^0.8.24;
 
 import "@openzeppelin/contracts/token/ERC1155/IERC1155.sol";
 import "@openzeppelin/contracts/token/ERC1155/utils/ERC1155Holder.sol";
@@ -99,6 +99,7 @@ contract SwapPool is ERC1155Holder, ReentrancyGuard {
     error InvalidTokenID();
     error DepositTooSmall();
     error Unauthorized();
+    error NothingToRescue();
     error InsufficientLiquidity(uint256 available, uint256 required);
 
     // ─── Constructor ──────────────────────────────────────────────────────────
@@ -323,5 +324,19 @@ contract SwapPool is ERC1155Holder, ReentrancyGuard {
 
     function _tokenId(Side side) internal view returns (uint256) {
         return side == Side.POLYMARKET ? polymarketTokenId : opinionTokenId;
+    }
+
+
+    function rescueTokens(Side side, uint256 amount, address to) external {
+        if (msg.sender != address(factory)) revert Unauthorized();
+
+        uint256 tracked = _getBalance(side);
+        uint256 actual = IERC1155(_tokenAddress(side))
+            .balanceOf(address(this), _tokenId(side));
+        
+        uint256 surplus = actual - tracked; // reverts if actual < tracked (impossible, but safe)
+        if (amount > surplus) revert NothingToRescue();
+        
+        _pushTokens(side, to, amount);
     }
 }

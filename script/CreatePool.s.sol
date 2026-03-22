@@ -26,7 +26,6 @@ contract CreatePool is Script {
         address factoryAddr = vm.envAddress("POOL_FACTORY_ADDRESS");
         uint256 polyId = vm.envUint("POLY_TOKEN_ID");
         uint256 opinionId = vm.envUint("OPINION_TOKEN_ID");
-        uint256 resolution = vm.envUint("RESOLUTION_DATE");
         string memory name = vm.envString("LP_NAME");
         string memory sym = vm.envString("LP_SYMBOL");
 
@@ -36,7 +35,6 @@ contract CreatePool is Script {
         console.log("Factory:         ", factoryAddr);
         console.log("Poly token ID:   ", polyId);
         console.log("Opinion token ID:", opinionId);
-        console.log("Resolution:      ", resolution);
         console.log("LP name:         ", name);
         console.log("LP symbol:       ", sym);
         console.log("");

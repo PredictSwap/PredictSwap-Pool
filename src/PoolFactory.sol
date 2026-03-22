@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+pragma solidity ^0.8.24;
 
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "./SwapPool.sol";
@@ -192,6 +192,11 @@ contract PoolFactory is Ownable {
         if (poolId >= pools.length) revert PoolNotFound(poolId);
         SwapPool(pools[poolId].swapPool).setSwapsPaused(paused_);
         emit PoolSwapsPaused(poolId, paused_);
+    }
+
+    // Rescue incorrectly tokens sent to pool     
+    function rescuePoolTokens(uint256 poolId, SwapPool.Side side, uint256 amount, address to) external onlyOwner {
+        SwapPool(pools[poolId].swapPool).rescueTokens(side, amount, to);
     }
 
     // ─── Internal ─────────────────────────────────────────────────────────────
