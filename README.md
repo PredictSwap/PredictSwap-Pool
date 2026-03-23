@@ -185,7 +185,13 @@ forge script script/integration_tests/Swap.s.sol \
   --rpc-url $POLYGON_RPC_URL --broadcast
 
 # Withdraw from pool
-forge script script/integration_tests/Withdraw.s.sol \
+forge script script/integration_tests/WithdrawBothSides.s.sol \
+  --rpc-url $POLYGON_RPC_URL --broadcast
+
+forge script script/integration_tests/WithdrawSingleSide.s.sol \
+  --rpc-url $POLYGON_RPC_URL --broadcast
+
+forge script script/integration_tests/WithdrawAll.s.sol \
   --rpc-url $POLYGON_RPC_URL --broadcast
 ```
 
