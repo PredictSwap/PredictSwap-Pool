@@ -35,7 +35,7 @@ contract Swap is Script {
         PoolFactory factory = PoolFactory(factAddr);
 
         PoolFactory.PoolInfo memory info = factory.getPool(poolId);
-        SwapPool pool = SwapPool(info.swapPool);
+        SwapPool pool = SwapPool(payable(info.swapPool));
 
         SwapPool.Side fromSide = SwapPool.Side(sideRaw);
 

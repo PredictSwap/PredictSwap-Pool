@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+pragma solidity ^0.8.24;
 
 import "forge-std/Script.sol";
 import "../../src/SwapPool.sol";
@@ -9,8 +9,13 @@ import "@openzeppelin/contracts/token/ERC1155/IERC1155.sol";
 
 /**
  * @title Deposit
- * @notice Deposits ERC-1155 shares into a SwapPool and receives LP tokens.
- *         Single-sided: deposit either Polymarket OR WrappedOpinion shares.
+ * @notice Deposits ERC-1155 shares into a SwapPool and receives the matching LP token.
+ *
+ *         Depositing Polymarket shares → receives polyLpToken
+ *         Depositing Opinion shares   → receives opinionLpToken
+ *
+ *         Both LP tokens share the same unified exchange rate:
+ *           rate = totalShares() / (polyLpToken.totalSupply() + opinionLpToken.totalSupply())
  *
  * Required env vars:
  *   DEPLOYER_PRIVATE_KEY   — wallet holding the ERC-1155 shares
@@ -20,7 +25,7 @@ import "@openzeppelin/contracts/token/ERC1155/IERC1155.sol";
  *   DEPOSIT_AMOUNT         — number of shares to deposit (in token units, no decimals)
  *
  * Run:
- *   forge script script/Deposit.s.sol --rpc-url polygon --broadcast
+ *   forge script script/integration_tests/Deposit.s.sol --rpc-url polygon --broadcast
  */
 contract Deposit is Script {
     function run() external {
@@ -34,10 +39,14 @@ contract Deposit is Script {
         PoolFactory factory = PoolFactory(factAddr);
 
         PoolFactory.PoolInfo memory info = factory.getPool(poolId);
-        SwapPool pool = SwapPool(info.swapPool);
-        LPToken lp = LPToken(info.lpToken);
+        SwapPool pool = SwapPool(payable(info.swapPool));
 
         SwapPool.Side side = SwapPool.Side(sideRaw);
+
+        // Resolve correct LP token and ERC-1155 token for the chosen side
+        address lpAddr = side == SwapPool.Side.POLYMARKET ? info.polyLpToken : info.opinionLpToken;
+        LPToken lp = LPToken(lpAddr);
+
         address tokenAddr = side == SwapPool.Side.POLYMARKET ? factory.polymarketToken() : factory.opinionToken();
         uint256 tokenId = side == SwapPool.Side.POLYMARKET ? info.polymarketTokenId : info.opinionTokenId;
 
@@ -46,22 +55,23 @@ contract Deposit is Script {
         uint256 rateBefore = pool.exchangeRate();
 
         console.log("=== Deposit ===");
-        console.log("Pool ID:        ", poolId);
-        console.log("SwapPool:       ", info.swapPool);
-        console.log("Side:           ", sideRaw == 0 ? "POLYMARKET" : "OPINION");
-        console.log("Token:          ", tokenAddr);
-        console.log("Token ID:       ", tokenId);
-        console.log("Wallet balance: ", tokenBalance);
-        console.log("Deposit amount: ", amount);
-        console.log("LP before:      ", lpBefore);
-        console.log("Exchange rate:  ", rateBefore);
+        console.log("Pool ID:          ", poolId);
+        console.log("SwapPool:         ", info.swapPool);
+        console.log("Side:             ", sideRaw == 0 ? "POLYMARKET" : "OPINION");
+        console.log("Token:            ", tokenAddr);
+        console.log("Token ID:         ", tokenId);
+        console.log("LP token:         ", lpAddr);
+        console.log("Wallet balance:   ", tokenBalance);
+        console.log("Deposit amount:   ", amount);
+        console.log("LP before:        ", lpBefore);
+        console.log("Exchange rate:    ", rateBefore);
+        console.log("Total LP supply:  ", pool.totalLpSupply());
         console.log("");
 
         require(tokenBalance >= amount, "Insufficient token balance");
 
         vm.startBroadcast(key);
 
-        // Approve pool to pull tokens if not already approved
         if (!IERC1155(tokenAddr).isApprovedForAll(sender, info.swapPool)) {
             IERC1155(tokenAddr).setApprovalForAll(info.swapPool, true);
             console.log("Approved SwapPool to transfer tokens");
@@ -72,8 +82,10 @@ contract Deposit is Script {
         vm.stopBroadcast();
 
         console.log("=== Done ===");
-        console.log("LP minted:    ", lpMinted);
-        console.log("LP after:     ", lp.balanceOf(sender));
-        console.log("Pool total shares:", pool.totalShares());
+        console.log("LP minted:         ", lpMinted);
+        console.log("LP after:          ", lp.balanceOf(sender));
+        console.log("Pool total shares: ", pool.totalShares());
+        console.log("Pool total LP:     ", pool.totalLpSupply());
+        console.log("Exchange rate now: ", pool.exchangeRate());
     }
 }

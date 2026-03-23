@@ -143,8 +143,6 @@ forge script script/CreatePool.s.sol \
 
 ## Integration Testing
 
-These scripts run against live testnet state and do not require `--verify`:
-
 ```bash
 # Deposit into pool
 forge script script/integration_tests/Deposit.s.sol \
@@ -161,19 +159,6 @@ forge script script/integration_tests/Withdraw.s.sol \
 
 ---
 
-## Environment Variables
-
-```env
-POLYGON_RPC_URL=
-POLYGON_CHAIN_ID=137
-BSC_RPC_URL=
-BSC_CHAIN_ID=56
-ETHERSCAN_API_KEY=
-PRIVATE_KEY=
-```
-
----
-
 ## Security
 
 - `ReentrancyGuard` on all state-mutating pool functions
@@ -181,8 +166,6 @@ PRIVATE_KEY=
 - `WrappedOpinionToken.setBridge()` callable only once (`BridgeAlreadySet` guard)
 - `OpinionEscrow` and `BridgeReceiver` are pausable by owner
 - Rescue functions for stuck tokens/ETH, with guards preventing rescue of actively locked funds
-
-Audit is in progress. Do not deploy to mainnet without a completed audit.
 
 ---
 

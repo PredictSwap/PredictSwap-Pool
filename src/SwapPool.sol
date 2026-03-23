@@ -3,6 +3,8 @@ pragma solidity ^0.8.24;
 
 import "@openzeppelin/contracts/token/ERC1155/IERC1155.sol";
 import "@openzeppelin/contracts/token/ERC1155/utils/ERC1155Holder.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "./LPToken.sol";
 import "./FeeCollector.sol";
@@ -19,15 +21,39 @@ import "./PoolFactory.sol";
  *
  *         Deployed by PoolFactory. One pool per matched market pair.
  *
+ * ─── Two LP tokens ────────────────────────────────────────────────────────────
+ *
+ *   polyLpToken   — minted when depositing Polymarket shares
+ *   opinionLpToken — minted when depositing WrappedOpinion shares
+ *
+ *   Both LP tokens share a single unified exchange rate:
+ *     rate = totalShares() / totalLpSupply()
+ *
+ *   The LP token type records which side a user deposited from, which
+ *   determines same-side vs cross-side withdrawal rules. It does NOT
+ *   affect the exchange rate — all LP holders earn fees equally.
+ *
  * ─── Pool Mechanics ───────────────────────────────────────────────────────────
  *
- *   rate        = totalShares / lpToken.totalSupply()
- *   lpToMint    = depositAmount * lpSupply / totalShares   (or 1:1 if first)
- *   toRelease   = lpBurned * totalShares / lpSupply
+ *   totalLpSupply = polyLpToken.totalSupply() + opinionLpToken.totalSupply()
+ *   rate          = totalShares() / totalLpSupply()
+ *   lpToMint      = depositAmount * totalLpSupply / totalShares  (or 1:1 if first)
+ *   sharesOut     = lpBurned * totalShares / totalLpSupply
  *
- *   Swap fee:   0.40% total
- *     0.30% LP fee  → stays in pool (auto-compounds, no new LP minted)
- *     0.10% protocol → transferred to FeeCollector
+ * ─── Withdrawal rules ─────────────────────────────────────────────────────────
+ *
+ *   Same-side  (burn polyLP → receive Poly, or burn opinionLP → receive Opinion):
+ *     Free, instant, no fee.
+ *
+ *   Cross-side (burn polyLP → receive Opinion, or burn opinionLP → receive Poly):
+ *     Swap fee applies (LP fee + protocol fee), same as swap().
+ *     After pool is marked resolved: cross-side is also free (market settled).
+ *
+ * ─── Swap fee ─────────────────────────────────────────────────────────────────
+ *
+ *   0.40% total (configurable in factory, capped by hard limits)
+ *     0.30% LP fee      → stays in pool on fromSide / receiveSide (auto-compounds)
+ *     0.10% protocol fee → transferred to FeeCollector
  *
  * ─── Side Enum ────────────────────────────────────────────────────────────────
  *
@@ -35,12 +61,12 @@ import "./PoolFactory.sol";
  *   Side.OPINION     = WrappedOpinion ERC-1155 shares (bridged from BSC)
  */
 contract SwapPool is ERC1155Holder, ReentrancyGuard {
-    // ─── Constants ────────────────────────────────────────────────────────────
-    // Fees are read from factory at swap time (configurable by owner)
+
+    using SafeERC20 for IERC20;
 
     // ─── Immutable config ─────────────────────────────────────────────────────
 
-    /// @notice Factory that deployed this pool — source of token contract addresses
+    /// @notice Factory that deployed this pool — source of token contract addresses and fees
     PoolFactory public immutable factory;
 
     /// @notice Polymarket ERC-1155 token ID for this pool's event-outcome
@@ -48,8 +74,11 @@ contract SwapPool is ERC1155Holder, ReentrancyGuard {
     /// @notice WrappedOpinion ERC-1155 token ID for this pool's event-outcome
     uint256 public immutable opinionTokenId;
 
-    /// @notice Associated LP token (ERC-20)
-    LPToken public immutable lpToken;
+    /// @notice LP token for Polymarket depositors
+    LPToken public immutable polyLpToken;
+    /// @notice LP token for Opinion depositors
+    LPToken public immutable opinionLpToken;
+
     /// @notice Protocol fee recipient
     FeeCollector public immutable feeCollector;
 
@@ -59,6 +88,10 @@ contract SwapPool is ERC1155Holder, ReentrancyGuard {
     uint256 public polymarketBalance;
     /// @notice WrappedOpinion shares held in this pool
     uint256 public opinionBalance;
+
+    /// @notice Set to true once the underlying market resolves.
+    ///         After resolution cross-side withdrawals are fee-free.
+    bool public resolved;
 
     bool public depositsPaused;
     bool public swapsPaused;
@@ -72,34 +105,62 @@ contract SwapPool is ERC1155Holder, ReentrancyGuard {
 
     // ─── Events ───────────────────────────────────────────────────────────────
 
-    event DepositsPausedSet(bool paused);
-    event SwapsPausedSet(bool paused);
+    event DepositsPausedSet(bool isPaused);
+    event SwapsPausedSet(bool isPaused);
+    event Resolved(bool isResolved);    
 
     event Deposited(address indexed user, Side side, uint256 sharesIn, uint256 lpMinted);
-    event Withdrawn(address indexed user, Side sideReceived, uint256 lpBurned, uint256 sharesOut);
-    event WithdrawnSplit(
+
+    /// @notice Emitted on every withdrawal, same-side or cross-side.
+    ///         lpFee and protocolFee are zero for same-side or post-resolution withdrawals.
+    event WithdrawnSingleSide(
         address indexed user,
+        Side lpSide,
+        Side receiveSide,
         uint256 lpBurned,
-        uint256 preferredOut,
-        Side preferredSide,
-        uint256 fallbackOut,
-        Side fallbackSide
+        uint256 sharesOut,
+        uint256 lpFee,
+        uint256 protocolFee
     );
+
+    event WithdrawnBothSides(
+        address indexed user,
+        Side lpSide,
+        uint256 lpBurned,
+        uint256 samesideOut,
+        uint256 crosssideOut,
+        uint256 crossLpFee,
+        uint256 crossProtocolFee
+    );
+
     event Swapped(
-        address indexed user, Side fromSide, uint256 amountIn, uint256 amountOut, uint256 lpFee, uint256 protocolFee
+        address indexed user,
+        Side fromSide,
+        uint256 amountIn,
+        uint256 amountOut,
+        uint256 lpFee,
+        uint256 protocolFee
     );
+
+    event TokensRescued(Side side, uint256 amount, address indexed to);
+    event ERC1155Rescued(address indexed token, uint256 tokenId, uint256 amount, address indexed to);
+    event ERC20Rescued(address indexed token, uint256 amount, address indexed to);
+    event ETHRescued(uint256 amount, address indexed to);
 
     // ─── Errors ───────────────────────────────────────────────────────────────
 
     error DepositsPaused();
     error SwapsPaused();
-
+    error AlreadyResolved();
+    error NotResolved();
+    error InvalidSplit();
     error ZeroAmount();
     error ZeroAddress();
     error InvalidTokenID();
     error DepositTooSmall();
     error Unauthorized();
     error NothingToRescue();
+    error CannotRescuePoolTokens();
     error InsufficientLiquidity(uint256 available, uint256 required);
 
     // ─── Constructor ──────────────────────────────────────────────────────────
@@ -108,19 +169,24 @@ contract SwapPool is ERC1155Holder, ReentrancyGuard {
         address factory_,
         uint256 polymarketTokenId_,
         uint256 opinionTokenId_,
-        address lpToken_,
+        address polyLpToken_,
+        address opinionLpToken_,
         address feeCollector_
     ) {
-        if (factory_ == address(0) || lpToken_ == address(0) || feeCollector_ == address(0)) {
-            revert ZeroAddress();
-        }
+        if (
+            factory_ == address(0) ||
+            polyLpToken_ == address(0) ||
+            opinionLpToken_ == address(0) ||
+            feeCollector_ == address(0)
+        ) revert ZeroAddress();
 
         if (polymarketTokenId_ == 0 || opinionTokenId_ == 0) revert InvalidTokenID();
 
         factory = PoolFactory(factory_);
         polymarketTokenId = polymarketTokenId_;
         opinionTokenId = opinionTokenId_;
-        lpToken = LPToken(lpToken_);
+        polyLpToken = LPToken(polyLpToken_);
+        opinionLpToken = LPToken(opinionLpToken_);
         feeCollector = FeeCollector(feeCollector_);
     }
 
@@ -131,13 +197,19 @@ contract SwapPool is ERC1155Holder, ReentrancyGuard {
         return polymarketBalance + opinionBalance;
     }
 
+    /// @notice Combined supply of both LP tokens — used as the unified denominator
+    function totalLpSupply() public view returns (uint256) {
+        return polyLpToken.totalSupply() + opinionLpToken.totalSupply();
+    }
+
     /**
      * @notice Current LP exchange rate scaled by 1e18.
-     *         rate = totalShares / lpSupply
+     *         rate = totalShares / totalLpSupply
      *         Returns 1e18 when pool is empty (first deposit rate).
+     *         Both LP token types share this same rate.
      */
     function exchangeRate() public view returns (uint256) {
-        uint256 supply = lpToken.totalSupply();
+        uint256 supply = totalLpSupply();
         if (supply == 0) return 1e18;
         return (totalShares() * 1e18) / supply;
     }
@@ -145,8 +217,10 @@ contract SwapPool is ERC1155Holder, ReentrancyGuard {
     // ─── Deposit ──────────────────────────────────────────────────────────────
 
     /**
-     * @notice Deposit shares into the pool and receive LP tokens.
-     *         Single-sided: deposit only Polymarket OR only WrappedOpinion.
+     * @notice Deposit shares into the pool and receive the matching LP token.
+     *         Depositing Polymarket shares mints polyLpToken.
+     *         Depositing Opinion shares mints opinionLpToken.
+     *         Both LP tokens use the same unified exchange rate.
      *
      * @param side    Which token to deposit (POLYMARKET or OPINION)
      * @param amount  Number of ERC-1155 shares to deposit
@@ -157,20 +231,19 @@ contract SwapPool is ERC1155Holder, ReentrancyGuard {
 
         _pullTokens(side, msg.sender, amount);
 
-        uint256 supply = lpToken.totalSupply();
+        uint256 supply = totalLpSupply();
         if (supply == 0) {
-            // First depositor: 1 share = 1 LP token
+            // First depositor across either side: 1 share = 1 LP token
             lpMinted = amount;
         } else {
-            // Calculated before _updateBalance so totalShares() is pre-deposit
+            // Use totalShares() before updating balance
             lpMinted = (amount * supply) / totalShares();
         }
 
-        // Ensure user receives at least 1 LP token
         if (lpMinted == 0) revert DepositTooSmall();
 
         _updateBalance(side, amount, true);
-        lpToken.mint(msg.sender, lpMinted);
+        _lpToken(side).mint(msg.sender, lpMinted);
 
         emit Deposited(msg.sender, side, amount, lpMinted);
     }
@@ -179,57 +252,140 @@ contract SwapPool is ERC1155Holder, ReentrancyGuard {
 
     /**
      * @notice Burn LP tokens and receive underlying shares.
-     *         User specifies a preferred side. Pool pays from preferred side
-     *         if available, otherwise falls back or splits across both sides.
      *
-     * @param lpAmount       LP tokens to burn
-     * @param preferredSide  Preferred side to receive (POLYMARKET or OPINION)
+     *         lpSide      — which LP token to burn (matches the side originally deposited)
+     *         receiveSide — which ERC-1155 token to receive
+     *
+     *         Same-side   (lpSide == receiveSide): free, no fee.
+     *         Cross-side  (lpSide != receiveSide): swap fee deducted from sharesOut,
+     *                     unless the pool is marked resolved (fee-free after resolution).
+     *
+     * @param lpAmount     LP tokens to burn
+     * @param lpSide       Side of LP token to burn (POLYMARKET or OPINION)
+     * @param receiveSide  Side of ERC-1155 shares to receive
      */
-    function withdraw(uint256 lpAmount, Side preferredSide) external nonReentrant returns (uint256 sharesOut) {
+    function withdrawSingleSide(
+        uint256 lpAmount,
+        Side lpSide,
+        Side receiveSide
+    ) external nonReentrant {
         if (lpAmount == 0) revert ZeroAmount();
 
-        sharesOut = (lpAmount * totalShares()) / lpToken.totalSupply();
+        uint256 sharesOut = (lpAmount * totalShares()) / totalLpSupply();
 
         // Burn LP first (CEI pattern)
-        lpToken.burn(msg.sender, lpAmount);
+        _lpToken(lpSide).burn(msg.sender, lpAmount);
 
-        (uint256 preferredAvail, uint256 fallbackAvail, Side fallbackSide) = _sideBalances(preferredSide);
+        uint256 lpFee;
+        uint256 protocolFee;
+        uint256 actualOut;
 
-        if (sharesOut <= preferredAvail) {
-            // Preferred side has enough
-            _updateBalance(preferredSide, sharesOut, false);
-            _pushTokens(preferredSide, msg.sender, sharesOut);
-            emit Withdrawn(msg.sender, preferredSide, lpAmount, sharesOut);
-        } else if (preferredAvail == 0) {
-            // Preferred side empty — use fallback entirely
-            if (sharesOut > fallbackAvail) revert InsufficientLiquidity(fallbackAvail, sharesOut);
-            _updateBalance(fallbackSide, sharesOut, false);
-            _pushTokens(fallbackSide, msg.sender, sharesOut);
-            emit Withdrawn(msg.sender, fallbackSide, lpAmount, sharesOut);
+        if (lpSide == receiveSide) {
+            // ── Same-side: free ──────────────────────────────────────────────
+            uint256 avail = _getBalance(receiveSide);
+            if (sharesOut > avail) revert InsufficientLiquidity(avail, sharesOut);
+
+            _updateBalance(receiveSide, sharesOut, false);
+            _pushTokens(receiveSide, msg.sender, sharesOut);
+
+            emit WithdrawnSingleSide(msg.sender, lpSide, receiveSide, lpAmount, sharesOut, 0, 0);
         } else {
-            // Split: drain preferred side, take remainder from fallback
-            uint256 remainder = sharesOut - preferredAvail;
-            if (remainder > fallbackAvail) revert InsufficientLiquidity(preferredAvail + fallbackAvail, sharesOut);
+            // ── Cross-side ───────────────────────────────────────────────────
+            uint256 avail = _getBalance(receiveSide);
+            if (sharesOut > avail) revert InsufficientLiquidity(avail, sharesOut);
 
-            _updateBalance(preferredSide, preferredAvail, false);
-            _updateBalance(fallbackSide, remainder, false);
-            _pushTokens(preferredSide, msg.sender, preferredAvail);
-            _pushTokens(fallbackSide, msg.sender, remainder);
+            if (resolved) {
+                // After resolution: cross-side is also free
+                actualOut = sharesOut;
+                _updateBalance(receiveSide, actualOut, false);
+                _pushTokens(receiveSide, msg.sender, actualOut);
+            } else {
+                // Charge swap fee on sharesOut (same fee schedule as swap())
+                lpFee = (sharesOut * factory.lpFeeBps()) / factory.FEE_DENOMINATOR();
+                protocolFee = (sharesOut * factory.protocolFeeBps()) / factory.FEE_DENOMINATOR();
+                actualOut = sharesOut - lpFee - protocolFee;
 
-            emit WithdrawnSplit(msg.sender, lpAmount, preferredAvail, preferredSide, remainder, fallbackSide);
+                // lpFee stays in receiveSide balance implicitly (only subtract actualOut + protocolFee)
+                _updateBalance(receiveSide, actualOut + protocolFee, false);
+                _pushTokens(receiveSide, msg.sender, actualOut);
+
+                if (protocolFee > 0) {
+                    _pushTokens(receiveSide, address(feeCollector), protocolFee);
+                    feeCollector.recordFee(_tokenAddress(receiveSide), _tokenId(receiveSide), protocolFee);
+                }
+            }
+
+            emit WithdrawnSingleSide(msg.sender, lpSide, receiveSide, lpAmount, actualOut, lpFee, protocolFee);
         }
+    }
+
+    function withdrawBothSides(
+        uint256 lpAmount,
+        Side lpSide,
+        uint256 samesideAmount,
+        uint256 crosssideAmount
+    ) external nonReentrant {
+        if (lpAmount == 0) revert ZeroAmount();
+
+        uint256 grossOut = (lpAmount * totalShares()) / totalLpSupply();
+        if (samesideAmount + crosssideAmount != grossOut) revert InvalidSplit();
+
+        _lpToken(lpSide).burn(msg.sender, lpAmount);
+
+        Side sameSide  = lpSide;
+        Side crossSide = _oppositeSide(lpSide);
+
+        // Same-side: free
+        if (samesideAmount > 0) {
+            uint256 avail = _getBalance(sameSide);
+            if (samesideAmount > avail) revert InsufficientLiquidity(avail, samesideAmount);
+            _updateBalance(sameSide, samesideAmount, false);
+            _pushTokens(sameSide, msg.sender, samesideAmount);
+        }
+
+        // Cross-side: fee applies
+        uint256 crossActualOut;
+        uint256 crossLpFee;
+        uint256 crossProtocolFee;
+
+        if (crosssideAmount > 0) {
+            uint256 avail = _getBalance(crossSide);
+            if (crosssideAmount > avail) revert InsufficientLiquidity(avail, crosssideAmount);
+
+            if (resolved) {
+                // After resolution: cross-side is also free
+                crossActualOut = crosssideAmount;
+                _updateBalance(crossSide, crossActualOut, false);
+                _pushTokens(crossSide, msg.sender, crossActualOut);
+            } else {
+                // Charge swap fee on crosssideAmount (same fee schedule as swap())
+                crossLpFee       = (crosssideAmount * factory.lpFeeBps())       / factory.FEE_DENOMINATOR();
+                crossProtocolFee = (crosssideAmount * factory.protocolFeeBps()) / factory.FEE_DENOMINATOR();
+                crossActualOut   = crosssideAmount - crossLpFee - crossProtocolFee;
+
+                // lpFee stays in crossSide balance implicitly (only subtract crossActualOut + crossProtocolFee)
+                _updateBalance(crossSide, crossActualOut + crossProtocolFee, false);
+                _pushTokens(crossSide, msg.sender, crossActualOut);
+
+                if (crossProtocolFee > 0) {
+                    _pushTokens(crossSide, address(feeCollector), crossProtocolFee);
+                    feeCollector.recordFee(_tokenAddress(crossSide), _tokenId(crossSide), crossProtocolFee);
+                }
+            }
+        }
+
+        emit WithdrawnBothSides(msg.sender, lpSide, lpAmount, samesideAmount, crossActualOut, crossLpFee, crossProtocolFee);
     }
 
     // ─── Swap ─────────────────────────────────────────────────────────────────
 
     /**
      * @notice Swap shares from one side to the other.
-     *         User deposits `fromSide` shares, receives equivalent `toSide`
-     *         shares minus 0.40% total fee.
+     *         User deposits `fromSide` shares, receives `toSide` shares minus fee.
      *
      *         Fee split:
-     *           0.30% LP fee     → stays in pool as extra shares (auto-compounds)
-     *           0.10% protocol   → transferred to FeeCollector
+     *           LP fee       → stays in pool on fromSide (auto-compounds for all LP holders)
+     *           Protocol fee → transferred to FeeCollector
      *
      * @param fromSide  Side being deposited
      * @param amountIn  Number of shares deposited
@@ -249,16 +405,14 @@ contract SwapPool is ERC1155Holder, ReentrancyGuard {
 
         _pullTokens(fromSide, msg.sender, amountIn);
 
-        // Protocol fee out to FeeCollector (skip if zero — e.g. zero-fee config or tiny amount)
         if (protocolFee > 0) {
             _pushTokens(fromSide, address(feeCollector), protocolFee);
             feeCollector.recordFee(_tokenAddress(fromSide), _tokenId(fromSide), protocolFee);
         }
 
-        // Output to user
         _pushTokens(toSide, msg.sender, amountOut);
 
-        // LP fee stays in pool on fromSide (auto-compounds)
+        // LP fee stays in fromSide balance (amountIn - protocolFee added, not amountIn - protocolFee - lpFee)
         _updateBalance(fromSide, amountIn - protocolFee, true);
         _updateBalance(toSide, amountOut, false);
 
@@ -278,6 +432,77 @@ contract SwapPool is ERC1155Holder, ReentrancyGuard {
         swapsPaused = paused_;
         emit SwapsPausedSet(paused_);
     }
+
+    /// @notice Mark this pool as resolved. Cross-side withdrawals become fee-free.
+    ///         Called by factory (owner-gated) once the underlying market settles.
+    function setResolved() external {
+        if (msg.sender != address(factory)) revert Unauthorized();
+        if (resolved) revert AlreadyResolved();
+        resolved = true;
+        depositsPaused = true;          
+        emit Resolved(resolved);
+        emit DepositsPausedSet(depositsPaused);
+    }
+
+    function unsetResolved() external {
+        if (msg.sender != address(factory)) revert Unauthorized();
+        if (!resolved) revert NotResolved();
+        resolved = false;
+        depositsPaused = false;
+        emit Resolved(resolved);
+        emit DepositsPausedSet(depositsPaused);
+    }
+
+
+    // ─── Rescue ───────────────────────────────────────────────────────────────
+
+    /// @notice Recover surplus pool tokens sent directly without using deposit().
+    ///         Only the untracked surplus above the pool's accounting is rescuable.
+    ///         LP holder funds are never at risk.
+    function rescueTokens(Side side, uint256 amount, address to) external {
+        if (msg.sender != address(factory)) revert Unauthorized();
+        if (to == address(0)) revert ZeroAddress();
+
+        uint256 tracked = _getBalance(side);
+        uint256 actual = IERC1155(_tokenAddress(side)).balanceOf(address(this), _tokenId(side));
+        uint256 surplus = actual - tracked;
+        if (amount > surplus) revert NothingToRescue();
+
+        _pushTokens(side, to, amount);
+        emit TokensRescued(side, amount, to);
+    }
+
+    /// @notice Recover any other ERC-1155 token accidentally sent to this contract.
+    ///         Reverts if token is the pool's own Polymarket or Opinion token
+    ///         (use rescueTokens for those).
+    function rescueERC1155(address token, uint256 tokenId, uint256 amount, address to) external {
+        if (msg.sender != address(factory)) revert Unauthorized();
+        if (to == address(0)) revert ZeroAddress();
+        if (token == factory.polymarketToken() || token == factory.opinionToken())
+            revert CannotRescuePoolTokens();
+        IERC1155(token).safeTransferFrom(address(this), to, tokenId, amount, "");
+        emit ERC1155Rescued(token, tokenId, amount, to);
+    }
+
+    /// @notice Recover any ERC-20 token accidentally sent to this contract.
+    function rescueERC20(address token, uint256 amount, address to) external {
+        if (msg.sender != address(factory)) revert Unauthorized();
+        if (to == address(0)) revert ZeroAddress();
+        IERC20(token).safeTransfer(to, amount);
+        emit ERC20Rescued(token, amount, to);
+    }
+
+    /// @notice Recover ETH accidentally sent to this contract.
+    function rescueETH(address payable to) external {
+        if (msg.sender != address(factory)) revert Unauthorized();
+        if (to == address(0)) revert ZeroAddress();
+        uint256 balance = address(this).balance;
+        (bool ok,) = to.call{value: balance}("");
+        require(ok, "ETH transfer failed");
+        emit ETHRescued(balance, to);
+    }
+
+    receive() external payable {}
 
     // ─── Internal helpers ─────────────────────────────────────────────────────
 
@@ -305,38 +530,15 @@ contract SwapPool is ERC1155Holder, ReentrancyGuard {
         return side == Side.POLYMARKET ? Side.OPINION : Side.POLYMARKET;
     }
 
-    function _sideBalances(Side preferred)
-        internal
-        view
-        returns (uint256 preferredAvail, uint256 fallbackAvail, Side fallbackSide)
-    {
-        if (preferred == Side.POLYMARKET) {
-            return (polymarketBalance, opinionBalance, Side.OPINION);
-        } else {
-            return (opinionBalance, polymarketBalance, Side.POLYMARKET);
-        }
+    function _lpToken(Side side) internal view returns (LPToken) {
+        return side == Side.POLYMARKET ? polyLpToken : opinionLpToken;
     }
 
-    /// @notice Token contract address — read from factory (single source of truth)
     function _tokenAddress(Side side) internal view returns (address) {
         return side == Side.POLYMARKET ? factory.polymarketToken() : factory.opinionToken();
     }
 
     function _tokenId(Side side) internal view returns (uint256) {
         return side == Side.POLYMARKET ? polymarketTokenId : opinionTokenId;
-    }
-
-
-    function rescueTokens(Side side, uint256 amount, address to) external {
-        if (msg.sender != address(factory)) revert Unauthorized();
-
-        uint256 tracked = _getBalance(side);
-        uint256 actual = IERC1155(_tokenAddress(side))
-            .balanceOf(address(this), _tokenId(side));
-        
-        uint256 surplus = actual - tracked; // reverts if actual < tracked (impossible, but safe)
-        if (amount > surplus) revert NothingToRescue();
-        
-        _pushTokens(side, to, amount);
     }
 }
