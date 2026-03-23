@@ -310,7 +310,7 @@ contract PredictSwapTest is Test {
 
     function test_Factory_resolvePool_pausesDeposits() public {
         vm.prank(owner);
-        factory.resolvePool(0);
+        factory.resolvePoolAndPausedDeposits(0);
 
         assertTrue(pool.resolved());
         assertTrue(pool.depositsPaused());
@@ -318,7 +318,7 @@ contract PredictSwapTest is Test {
 
     function test_Factory_unresolvePool_unpausesDeposits() public {
         vm.prank(owner);
-        factory.resolvePool(0);
+        factory.resolvePoolAndPausedDeposits(0);
 
         vm.prank(owner);
         factory.unresolvePool(0);
@@ -329,11 +329,11 @@ contract PredictSwapTest is Test {
 
     function test_Factory_resolvePool_revertsIfAlreadyResolved() public {
         vm.prank(owner);
-        factory.resolvePool(0);
+        factory.resolvePoolAndPausedDeposits(0);
 
         vm.prank(owner);
         vm.expectRevert(SwapPool.AlreadyResolved.selector);
-        factory.resolvePool(0);
+        factory.resolvePoolAndPausedDeposits(0);
     }
 
     function test_Factory_unresolvePool_revertsIfNotResolved() public {
@@ -498,7 +498,7 @@ contract PredictSwapTest is Test {
         pool.deposit(SwapPool.Side.OPINION, 5000);
 
         vm.prank(owner);
-        factory.resolvePool(0);
+        factory.resolvePoolAndPausedDeposits(0);
 
         uint256 opinionBefore = opinionToken.balanceOf(lp1, OPINION_ID);
 
@@ -617,7 +617,7 @@ contract PredictSwapTest is Test {
         uint256 opinionBefore = opinionToken.balanceOf(lp1, OPINION_ID);
 
         vm.prank(lp1);
-        pool.withdrawBothSides(5000, SwapPool.Side.POLYMARKET, 4000, 1000);
+        pool.withdrawBothSides(5000, SwapPool.Side.POLYMARKET, 8000);
 
         // Same-side: 4000 POLY, no fee
         assertEq(polyToken.balanceOf(lp1, POLY_ID), polyBefore + 4000);
@@ -635,7 +635,7 @@ contract PredictSwapTest is Test {
         uint256 polyBefore = polyToken.balanceOf(lp1, POLY_ID);
 
         vm.prank(lp1);
-        pool.withdrawBothSides(1000, SwapPool.Side.POLYMARKET, 1000, 0);
+        pool.withdrawBothSides(1000, SwapPool.Side.POLYMARKET, 10000);
 
         assertEq(polyToken.balanceOf(lp1, POLY_ID), polyBefore + 1000);
         assertEq(polyLp.balanceOf(lp1), 0);
@@ -648,12 +648,12 @@ contract PredictSwapTest is Test {
         pool.deposit(SwapPool.Side.OPINION, 5000);
 
         vm.prank(owner);
-        factory.resolvePool(0);
+        factory.resolvePoolAndPausedDeposits(0);
 
         uint256 opinionBefore = opinionToken.balanceOf(lp1, OPINION_ID);
 
         vm.prank(lp1);
-        pool.withdrawBothSides(5000, SwapPool.Side.POLYMARKET, 4000, 1000);
+        pool.withdrawBothSides(5000, SwapPool.Side.POLYMARKET, 8000);
 
         // Cross-side resolved → no fee, full 1000 Opinion
         assertEq(opinionToken.balanceOf(lp1, OPINION_ID), opinionBefore + 1000);
@@ -667,13 +667,13 @@ contract PredictSwapTest is Test {
         vm.prank(lp1);
         vm.expectRevert(SwapPool.InvalidSplit.selector);
         // grossOut = 1000, but 600 + 600 = 1200 ≠ 1000
-        pool.withdrawBothSides(1000, SwapPool.Side.POLYMARKET, 600, 600);
+        pool.withdrawBothSides(1000, SwapPool.Side.POLYMARKET, 5000);
     }
 
     function test_WithdrawBothSides_revertsZeroAmount() public {
         vm.prank(lp1);
         vm.expectRevert(SwapPool.ZeroAmount.selector);
-        pool.withdrawBothSides(0, SwapPool.Side.POLYMARKET, 0, 0);
+        pool.withdrawBothSides(0, SwapPool.Side.POLYMARKET, 0);
     }
 
     function test_WithdrawBothSides_revertsInsufficientCrossSideLiquidity() public {
@@ -683,7 +683,7 @@ contract PredictSwapTest is Test {
 
         vm.prank(lp1);
         vm.expectRevert(); // InsufficientLiquidity
-        pool.withdrawBothSides(1000, SwapPool.Side.POLYMARKET, 500, 500);
+        pool.withdrawBothSides(1000, SwapPool.Side.POLYMARKET, 50000);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -1014,7 +1014,7 @@ contract PredictSwapTest is Test {
         pool.deposit(SwapPool.Side.OPINION, 5000);
 
         vm.prank(owner);
-        factory.resolvePool(0);
+        factory.resolvePoolAndPausedDeposits(0);
 
         uint256 opinionBefore = opinionToken.balanceOf(lp1, OPINION_ID);
         uint256 polyBefore    = polyToken.balanceOf(lp2, POLY_ID);

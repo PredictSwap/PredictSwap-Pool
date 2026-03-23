@@ -229,14 +229,19 @@ contract SwapPool is ERC1155Holder, ReentrancyGuard {
      * @return protocolFee Fee transferred to FeeCollector
      */
     function _computeFees(uint256 amount) internal view returns (uint256 lpFee, uint256 protocolFee) {
-        uint256 denom = factory.FEE_DENOMINATOR();
-        uint256 lbps  = factory.lpFeeBps();
-        uint256 pbps  = factory.protocolFeeBps();
+        uint256 denom    = factory.FEE_DENOMINATOR();
+        uint256 lbps     = factory.lpFeeBps();
+        uint256 pbps     = factory.protocolFeeBps();
+        uint256 totalBps = lbps + pbps;
 
-        // Ceiling division: (a * b + denom - 1) / denom
-        // When bps == 0 (fee disabled), result is 0 — the guard is defensive.
-        lpFee       = lbps > 0 ? (amount * lbps  + denom - 1) / denom : 0;
-        protocolFee = pbps > 0 ? (amount * pbps  + denom - 1) / denom : 0;
+        if (totalBps == 0) return (0, 0);
+
+        // Single ceiling rounding on the combined fee — one rounding event, not two
+        uint256 totalFee = (amount * totalBps + denom - 1) / denom;
+
+        // Split proportionally: protocolFee gets floor, lpFee absorbs the remainder
+        protocolFee = pbps > 0 ? (totalFee * pbps) / totalBps : 0;
+        lpFee       = totalFee - protocolFee;
     }
 
     // ─── Deposit ──────────────────────────────────────────────────────────────
