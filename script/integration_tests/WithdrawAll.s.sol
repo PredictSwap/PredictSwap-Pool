@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: BUSL-1.1
 pragma solidity ^0.8.24;
 
 import "forge-std/Script.sol";
@@ -10,14 +10,14 @@ import "@openzeppelin/contracts/token/ERC1155/IERC1155.sol";
 /**
  * @title WithdrawAll
  * @notice Convenience script: burns the caller's full balance of BOTH LP tokens
- *         (polyLpToken and opinionLpToken) in two same-side withdrawals.
+ *         (marketALpToken and marketBLpToken) in two same-side withdrawals.
  *
  *         Both withdrawals are same-side and therefore always free and never
  *         blocked by swapsPaused.
  *
  *         Useful for a clean full exit without paying cross-side fees:
- *           polyLP  → POLYMARKET shares   (same-side, free)
- *           opinionLP → OPINION shares    (same-side, free)
+ *           marketALp → MARKET_A shares  (same-side, free)
+ *           marketBLp → MARKET_B shares  (same-side, free)
  *
  *         If one LP balance is zero the corresponding withdrawal is skipped.
  *
@@ -36,71 +36,80 @@ contract WithdrawAll is Script {
         uint256 poolId   = vm.envUint("POOL_ID");
 
         address sender = vm.addr(key);
-        PoolFactory factory  = PoolFactory(factAddr);
+        PoolFactory factory = PoolFactory(factAddr);
         PoolFactory.PoolInfo memory info = factory.getPool(poolId);
-        SwapPool pool        = SwapPool(payable(info.swapPool));
+        SwapPool pool = SwapPool(payable(info.swapPool));
 
-        LPToken polyLp    = LPToken(info.polyLpToken);
-        LPToken opinionLp = LPToken(info.opinionLpToken);
+        LPToken marketALp = LPToken(info.marketALpToken);
+        LPToken marketBLp = LPToken(info.marketBLpToken);
 
-        uint256 polyLpBal    = polyLp.balanceOf(sender);
-        uint256 opinionLpBal = opinionLp.balanceOf(sender);
+        uint256 marketALpBal = marketALp.balanceOf(sender);
+        uint256 marketBLpBal = marketBLp.balanceOf(sender);
 
-        uint256 supply   = pool.totalLpSupply();
-        uint256 polyGross    = (supply > 0 && polyLpBal > 0)
-            ? (polyLpBal    * pool.totalShares()) / supply : 0;
-        uint256 opinionGross = (supply > 0 && opinionLpBal > 0)
-            ? (opinionLpBal * pool.totalShares()) / supply : 0;
+        // Gross estimates for pre-flight display — uses normalized shares
+        uint256 supply       = pool.totalLpSupply();
+        uint256 marketAGross = (supply > 0 && marketALpBal > 0)
+            ? (marketALpBal * pool.totalSharesNorm()) / supply : 0;
+        uint256 marketBGross = (supply > 0 && marketBLpBal > 0)
+            ? (marketBLpBal * pool.totalSharesNorm()) / supply : 0;
+
+        // Resolve market contracts and token IDs from pool
+        address marketAContract = pool.marketAContract();
+        address marketBContract = pool.marketBContract();
+        uint256 marketATokenId  = pool.marketATokenId();
+        uint256 marketBTokenId  = pool.marketBTokenId();
 
         console.log("=== WithdrawAll (same-side, free) ===");
-        console.log("Pool ID:              ", poolId);
-        console.log("SwapPool:             ", info.swapPool);
-        console.log("Pool resolved:        ", pool.resolved() ? "YES" : "NO");
-        console.log("Pool depositsPaused:  ", pool.depositsPaused() ? "YES" : "NO");
-        console.log("Pool swapsPaused:     ", pool.swapsPaused() ? "YES (no effect on same-side)" : "NO");
-        console.log("polyLP balance:       ", polyLpBal);
-        console.log("opinionLP balance:    ", opinionLpBal);
-        console.log("POLY gross out est:   ", polyGross);
-        console.log("OPINION gross out est:", opinionGross);
-        console.log("Pool POLY bal:        ", pool.polymarketBalance());
-        console.log("Pool OPINION bal:     ", pool.opinionBalance());
-        console.log("Exchange rate:        ", pool.exchangeRate());
-        console.log("Total LP supply:      ", supply);
-        console.log("Wallet POLY:          ", IERC1155(factory.polymarketToken()).balanceOf(sender, info.polymarketTokenId));
-        console.log("Wallet OPINION:       ", IERC1155(factory.opinionToken()).balanceOf(sender, info.opinionTokenId));
+        console.log("Pool ID:                  ", poolId);
+        console.log("SwapPool:                 ", info.swapPool);
+        console.log("Market A:                 ", info.marketA.name);
+        console.log("Market B:                 ", info.marketB.name);
+        console.log("Pool resolved:            ", pool.resolved() ? "YES" : "NO");
+        console.log("Pool depositsPaused:      ", pool.depositsPaused() ? "YES" : "NO");
+        console.log("Pool swapsPaused:         ", pool.swapsPaused() ? "YES (no effect on same-side)" : "NO");
+        console.log("marketALp balance:        ", marketALpBal);
+        console.log("marketBLp balance:        ", marketBLpBal);
+        console.log("MARKET_A gross out (norm):", marketAGross);
+        console.log("MARKET_B gross out (norm):", marketBGross);
+        console.log("Pool MARKET_A bal:        ", pool.marketABalance());
+        console.log("Pool MARKET_B bal:        ", pool.marketBBalance());
+        console.log("Exchange rate:            ", pool.exchangeRate());
+        console.log("Total LP supply:          ", supply);
+        console.log("Wallet MARKET_A:          ", IERC1155(marketAContract).balanceOf(sender, marketATokenId));
+        console.log("Wallet MARKET_B:          ", IERC1155(marketBContract).balanceOf(sender, marketBTokenId));
         console.log("");
 
-        require(polyLpBal > 0 || opinionLpBal > 0, "No LP tokens to withdraw");
+        require(marketALpBal > 0 || marketBLpBal > 0, "No LP tokens to withdraw");
 
         vm.startBroadcast(key);
 
-        uint256 polyReceived;
-        uint256 opinionReceived;
+        uint256 marketAReceived;
+        uint256 marketBReceived;
 
-        if (polyLpBal > 0) {
-            polyReceived = pool.withdrawSingleSide(
-                polyLpBal,
-                SwapPool.Side.POLYMARKET,
-                SwapPool.Side.POLYMARKET
+        if (marketALpBal > 0) {
+            marketAReceived = pool.withdrawSingleSide(
+                marketALpBal,
+                SwapPool.Side.MARKET_A,
+                SwapPool.Side.MARKET_A
             );
         }
 
-        if (opinionLpBal > 0) {
-            opinionReceived = pool.withdrawSingleSide(
-                opinionLpBal,
-                SwapPool.Side.OPINION,
-                SwapPool.Side.OPINION
+        if (marketBLpBal > 0) {
+            marketBReceived = pool.withdrawSingleSide(
+                marketBLpBal,
+                SwapPool.Side.MARKET_B,
+                SwapPool.Side.MARKET_B
             );
         }
 
         vm.stopBroadcast();
 
         console.log("=== Done ===");
-        console.log("POLY received:        ", polyReceived);
-        console.log("OPINION received:     ", opinionReceived);
-        console.log("polyLP remaining:     ", polyLp.balanceOf(sender));
-        console.log("opinionLP remaining:  ", opinionLp.balanceOf(sender));
-        console.log("Wallet POLY after:    ", IERC1155(factory.polymarketToken()).balanceOf(sender, info.polymarketTokenId));
-        console.log("Wallet OPINION after: ", IERC1155(factory.opinionToken()).balanceOf(sender, info.opinionTokenId));
+        console.log("MARKET_A received:        ", marketAReceived);
+        console.log("MARKET_B received:        ", marketBReceived);
+        console.log("marketALp remaining:      ", marketALp.balanceOf(sender));
+        console.log("marketBLp remaining:      ", marketBLp.balanceOf(sender));
+        console.log("Wallet MARKET_A after:    ", IERC1155(marketAContract).balanceOf(sender, marketATokenId));
+        console.log("Wallet MARKET_B after:    ", IERC1155(marketBContract).balanceOf(sender, marketBTokenId));
     }
 }
