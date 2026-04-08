@@ -30,6 +30,7 @@ import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 contract LPToken is ERC20 {
     address public pool;
     address public immutable factory;
+    uint256 public immutable tokenId;
 
     error OnlyPool();
     error OnlyFactory();
@@ -43,9 +44,10 @@ contract LPToken is ERC20 {
         _;
     }
 
-    constructor(string memory name_, string memory symbol_, address factory_) ERC20(name_, symbol_) {
+    constructor(string memory name_, string memory symbol_, address factory_, uint256 tokneId_) ERC20(name_, symbol_) {
         if (factory_ == address(0)) revert ZeroAddress();
         factory = factory_;
+        tokenId = tokneId_;
     }
 
     /**
