@@ -26,16 +26,13 @@ contract Deploy is Script {
     function run() external {
         uint256 deployerKey = vm.envUint("DEPLOYER_PRIVATE_KEY");
         address owner = vm.envAddress("OWNER_ADDRESS");
-        address polyToken = vm.envAddress("POLYMARKET_TOKEN_ADDRESS");
-        address opinionToken = vm.envAddress("OPINION_TOKEN_ADDRESS");
+        address operator = vm.envAddress("OPERATOR_ADDRESS");
 
         address deployer = vm.addr(deployerKey);
 
-        console.log("=== PredictSwap Pool Deploy ===");
+        console.log("=== PredictSwap PoolFactory Deploy ===");
         console.log("Deployer:      ", deployer);
         console.log("Owner:         ", owner);
-        console.log("Polymarket:    ", polyToken);
-        console.log("OpinionToken:  ", opinionToken);
         console.log("");
 
         vm.startBroadcast(deployerKey);
@@ -45,7 +42,7 @@ contract Deploy is Script {
         console.log("FeeCollector:  ", address(feeCollector));
 
         // 2. PoolFactory (owns FeeCollector authorisation, holds token addresses)
-        PoolFactory factory = new PoolFactory(polyToken, opinionToken, address(feeCollector), owner);
+        PoolFactory factory = new PoolFactory(address(feeCollector), operator, owner);
         console.log("PoolFactory:   ", address(factory));
 
         vm.stopBroadcast();
