@@ -151,18 +151,18 @@ source .env
 
 ```bash
 forge script script/integration_tests/DeployMockPoly.s.sol \
-  --rpc-url $RPC_URL \
+  --rpc-url $POLYGON_RPC_URL \
   --broadcast \
   --verify \
   --verifier etherscan \
-  --verifier-url "https://api.etherscan.io/v2/api?chainid=$CHAIN_ID" \
+  --verifier-url "https://api.etherscan.io/v2/api?chainid=$POLYGON_CHAIN_ID" \
   --etherscan-api-key $ETHERSCAN_API_KEY \
   -vvvv
 ```
 
 ```bash
 forge script script/integration_tests/MintMock.s.sol \
-  --rpc-url $RPC_URL \
+  --rpc-url $POLYGON_RPC_URL \
   --broadcast
 ```
 
@@ -172,11 +172,11 @@ Add `MARKET_A_CONTRACT`, `MARKET_B_CONTRACT`, `MARKET_A_TOKEN_ID`, `MARKET_B_TOK
 
 ```bash
 forge script script/Deploy.s.sol \
-  --rpc-url $RPC_URL \
+  --rpc-url $POLYGON_RPC_URL \
   --broadcast \
   --verify \
   --verifier etherscan \
-  --verifier-url "https://api.etherscan.io/v2/api?chainid=$CHAIN_ID" \
+  --verifier-url "https://api.etherscan.io/v2/api?chainid=$POLYGON_CHAIN_ID" \
   --etherscan-api-key $ETHERSCAN_API_KEY \
   -vvvv
 ```
@@ -189,7 +189,7 @@ Both market contracts must be whitelisted by the factory owner before a pool can
 
 ```bash
 forge script script/ApproveMarketContract.s.sol \
-  --rpc-url $RPC_URL \
+  --rpc-url $POLYGON_RPC_URL \
   --broadcast
 ```
 
@@ -197,11 +197,11 @@ forge script script/ApproveMarketContract.s.sol \
 
 ```bash
 forge script script/CreatePool.s.sol \
-  --rpc-url $RPC_URL \
+  --rpc-url $POLYGON_RPC_URL \
   --broadcast \
   --verify \
   --verifier etherscan \
-  --verifier-url "https://api.etherscan.io/v2/api?chainid=$CHAIN_ID" \
+  --verifier-url "https://api.etherscan.io/v2/api?chainid=$POLYGON_CHAIN_ID" \
   --etherscan-api-key $ETHERSCAN_API_KEY \
   -vvvv
 ```
@@ -213,21 +213,21 @@ forge script script/CreatePool.s.sol \
 ```bash
 # Deposit into pool
 forge script script/integration_tests/Deposit.s.sol \
-  --rpc-url $RPC_URL --broadcast
+  --rpc-url $POLYGON_RPC_URL --broadcast
 
 # Swap between sides
 forge script script/integration_tests/Swap.s.sol \
-  --rpc-url $RPC_URL --broadcast
+  --rpc-url $POLYGON_RPC_URL --broadcast
 
 # Withdraw from pool
 forge script script/integration_tests/WithdrawBothSides.s.sol \
-  --rpc-url $RPC_URL --broadcast
+  --rpc-url $POLYGON_RPC_URL --broadcast
 
 forge script script/integration_tests/WithdrawSingleSide.s.sol \
-  --rpc-url $RPC_URL --broadcast
+  --rpc-url $POLYGON_RPC_URL --broadcast
 
 forge script script/integration_tests/WithdrawAll.s.sol \
-  --rpc-url $RPC_URL --broadcast
+  --rpc-url $POLYGON_RPC_URL --broadcast
 ```
 
 ---

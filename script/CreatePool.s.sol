@@ -49,13 +49,13 @@ contract CreatePool is Script {
         address factoryAddr  = vm.envAddress("POOL_FACTORY_ADDRESS");
 
         // Market A config
-        address marketAContract = vm.envAddress("MARKET_A_CONTRACT");
+        address marketAContract = vm.envAddress("POLYMARKET_TOKEN_ADDRESS");
         uint256 marketATokenId  = vm.envUint("MARKET_A_TOKEN_ID");
         uint8   marketADecimals = uint8(vm.envUint("MARKET_A_DECIMALS"));
         string memory marketAName = vm.envString("MARKET_A_NAME");
 
         // Market B config
-        address marketBContract = vm.envAddress("MARKET_B_CONTRACT");
+        address marketBContract = vm.envAddress("OPINION_TOKEN_ADDRESS");
         uint256 marketBTokenId  = vm.envUint("MARKET_B_TOKEN_ID");
         uint8   marketBDecimals = uint8(vm.envUint("MARKET_B_DECIMALS"));
         string memory marketBName = vm.envString("MARKET_B_NAME");
