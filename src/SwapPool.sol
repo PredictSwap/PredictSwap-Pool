@@ -11,72 +11,33 @@ import "./FeeCollector.sol";
 import "./PoolFactory.sol";
 
 /**
- * @title SwapPool
- * @notice Holds two ERC-1155 prediction market shares for ONE specific event-outcome
- *         pair (marketA and marketB). Both sides represent the same real-world outcome
- *         and are treated as 1:1 equivalent in value.
+ * @title SwapPool v3 — Simplified Value Accounting
+ * @notice Holds two ERC-1155 prediction-market shares for ONE specific event-outcome
+ *         pair (marketA + marketB). Both sides are treated as 1:1 in value.
  *
- *         Fully self-describing — stores all identifying information about both markets
- *         including contract addresses, token IDs, decimals, platform names, and fees.
- *         No factory lookup needed to understand what a pool represents or what it charges.
+ *         Value accounting (replaces the v2 four-partition matrix):
+ *           aSideValue — total normalized value owed to marketA-side LP holders
+ *           bSideValue — total normalized value owed to marketB-side LP holders
  *
- *         Deployed by PoolFactory. One pool per matched market pair.
+ *         All values are stored in 18-decimal normalized units.
+ *         Transfers use raw native-decimal amounts via _toNorm / _fromNorm.
  *
- * ─── Two LP tokens ────────────────────────────────────────────────────────────
+ *         Per-side rates:
+ *           marketARate = aSideValue * 1e18 / marketALpSupply
+ *           marketBRate = bSideValue * 1e18 / marketBLpSupply
  *
- *   marketALpToken — minted when depositing marketA shares
- *   marketBLpToken — minted when depositing marketB shares
- *
- *   Both LP tokens share a single unified exchange rate:
- *     rate = totalSharesNorm() / totalLpSupply()
- *
- *   The LP token type records which side a user deposited from, which
- *   determines same-side vs cross-side withdrawal rules. It does NOT
- *   affect the exchange rate — all LP holders earn fees equally.
- *
- * ─── Decimal normalization ────────────────────────────────────────────────────
- *
- *   Raw balances are stored in each token's native decimals.
- *   All pool math (LP minting, exchange rate, fee computation) operates in a
- *   shared 18-decimal normalized space. Transfers always use raw amounts.
- *
- *   _toNorm(side, raw)    → normalized (18 dec)
- *   _fromNorm(side, norm) → raw (native dec)
- *
- * ─── Pool Mechanics ───────────────────────────────────────────────────────────
- *
- *   totalLpSupply  = marketALpToken.totalSupply() + marketBLpToken.totalSupply()
- *   rate           = totalSharesNorm() / totalLpSupply()
- *   lpToMint       = normAmount * totalLpSupply / totalSharesNorm  (or 1:1 if first)
- *   normOut        = lpBurned * totalSharesNorm / totalLpSupply
- *   rawOut         = _fromNorm(receiveSide, normOut)
+ *         Swaps credit the LP fee to the drained side's value.
+ *         Physical token composition is not tracked per-side — only total value.
  *
  * ─── Withdrawal rules ─────────────────────────────────────────────────────────
  *
- *   Same-side  (burn marketALp → receive marketA, or marketBLp → marketB):
- *     Free, instant, no fee.
+ *   swaps active + not resolved  → withdrawal(): choose side, 0.4% fee if cross-side
+ *   swaps active + resolved      → withdrawal(): choose side, no fee
+ *   swaps paused + not resolved  → withdrawProRata(): proportional split, no fee
+ *   swaps paused + resolved      → withdrawProRata(): proportional split, no fee
  *
- *   Cross-side (burn marketALp → receive marketB, or vice versa):
- *     Swap fee applies (LP fee + protocol fee), same as swap().
- *     After pool is marked resolved: cross-side is also free (market settled).
- *
- * ─── Swap fee ─────────────────────────────────────────────────────────────────
- *
- *   Set at pool creation, adjustable by owner via factory.setPoolFees().
- *     LP fee       → stays in pool on fromSide (auto-compounds for LPs)
- *     Protocol fee → transferred to FeeCollector
- *
- * ─── Access control ───────────────────────────────────────────────────────────
- *
- *   All admin functions are callable only by the factory contract. The factory
- *   enforces its own role split before routing calls here:
- *
- *   Factory owner only:
- *     setFees, rescueTokens, rescueERC1155, rescueERC20, rescueETH
- *
- *   Factory operator (or owner):
- *     setDepositsPaused, setSwapsPaused,
- *     setResolvedAndPausedDeposits, unsetResolved
+ *   Governing rule: swapsPaused determines which function is available.
+ *                   resolved determines whether cross-side fees apply.
  */
 contract SwapPool is ERC1155Holder, ReentrancyGuard {
 
@@ -91,50 +52,40 @@ contract SwapPool is ERC1155Holder, ReentrancyGuard {
 
     // ─── Immutable config ─────────────────────────────────────────────────────
 
-    /// @notice Factory that deployed this pool — sole authorized caller of admin functions.
     PoolFactory public immutable factory;
 
-    // Market A — hot path immutables
-    address public immutable marketAContract;  // ERC-1155 prediction market contract
-    uint256 public immutable marketATokenId;   // outcome/event ID within that contract
+    uint256 public immutable marketATokenId;
     uint8   public immutable marketADecimals;
 
-    // Market B — hot path immutables
-    address public immutable marketBContract;
     uint256 public immutable marketBTokenId;
     uint8   public immutable marketBDecimals;
 
-    /// @notice LP token for marketA depositors
-    LPToken public immutable marketALpToken;
-    /// @notice LP token for marketB depositors
-    LPToken public immutable marketBLpToken;
-
-    /// @notice Protocol fee recipient
     FeeCollector public immutable feeCollector;
+
+    // ─── LP tokenIds (set once via initialize) ────────────────────────────────
+
+    uint256 public marketALpTokenId;
+    uint256 public marketBLpTokenId;
+    bool    private _initialized;
 
     // ─── Fee config (mutable, owner-gated via factory) ────────────────────────
 
-    /// @notice LP fee in basis points — stays in pool, auto-compounds for LPs.
-    ///         Adjustable by factory owner via factory.setPoolFees().
     uint256 public lpFeeBps;
-
-    /// @notice Protocol fee in basis points — sent to FeeCollector.
-    ///         Adjustable by factory owner via factory.setPoolFees().
     uint256 public protocolFeeBps;
 
-    // ─── Cold metadata (UI only, never read in hot path) ──────────────────────
+    // ─── Value accounting (all values normalized to 18 decimals) ──────────────
 
-    /// @notice Human-readable platform name, e.g. "Polymarket"
-    string public marketAName;
-    /// @notice Human-readable platform name, e.g. "Opinion"
-    string public marketBName;
+    /// @notice Accounted balance of marketA-side LP holders (normalized 18-dec).
+    ///         Increases on deposits and swap fees; decreases on withdrawals.
+    ///         Dividing by LP supply gives the marketA-side exchange rate.
+    uint256 public aSideValue;
 
-    // ─── Pool state ───────────────────────────────────────────────────────────
+    /// @notice Accounted balance of marketB-side LP holders (normalized 18-dec).
+    ///         Increases on deposits and swap fees; decreases on withdrawals.
+    ///         Dividing by LP supply gives the marketB-side exchange rate.
+    uint256 public bSideValue;
 
-    /// @notice Raw marketA shares held in this pool (native decimals)
-    uint256 public marketABalance;
-    /// @notice Raw marketB shares held in this pool (native decimals)
-    uint256 public marketBBalance;
+    // ─── Admin flags ──────────────────────────────────────────────────────────
 
     bool public resolved;
     bool public depositsPaused;
@@ -149,6 +100,7 @@ contract SwapPool is ERC1155Holder, ReentrancyGuard {
 
     // ─── Events ───────────────────────────────────────────────────────────────
 
+    event Initialized(uint256 marketALpTokenId, uint256 marketBLpTokenId);
     event DepositsPausedSet(bool isPaused);
     event SwapsPausedSet(bool isPaused);
     event Resolved(bool isResolved);
@@ -156,24 +108,22 @@ contract SwapPool is ERC1155Holder, ReentrancyGuard {
 
     event Deposited(address indexed user, Side side, uint256 sharesIn, uint256 lpMinted);
 
-    event WithdrawnSingleSide(
+    event Withdrawn(
         address indexed user,
         Side lpSide,
         Side receiveSide,
         uint256 lpBurned,
-        uint256 sharesOut,
+        uint256 received,
         uint256 lpFee,
         uint256 protocolFee
     );
 
-    event WithdrawnBothSides(
+    event WithdrawnProRata(
         address indexed user,
         Side lpSide,
         uint256 lpBurned,
-        uint256 samesideOut,
-        uint256 crosssideOut,
-        uint256 crossLpFee,
-        uint256 crossProtocolFee
+        uint256 nativeOut,
+        uint256 crossOut
     );
 
     event Swapped(
@@ -186,17 +136,16 @@ contract SwapPool is ERC1155Holder, ReentrancyGuard {
     );
 
     event TokensRescued(Side side, uint256 amount, address indexed to);
-    event ERC1155Rescued(address indexed marketContract, uint256 tokenId, uint256 amount, address indexed to);
+    event ERC1155Rescued(address indexed contractAddr, uint256 tokenId, uint256 amount, address indexed to);
     event ERC20Rescued(address indexed token, uint256 amount, address indexed to);
     event ETHRescued(uint256 amount, address indexed to);
 
     // ─── Errors ───────────────────────────────────────────────────────────────
 
     error DepositsPaused();
+    error MarketResolved();
     error SwapsPaused();
-    error AlreadyResolved();
-    error NotResolved();
-    error InvalidSplit();
+    error SwapsNotPaused();
     error ZeroAmount();
     error ZeroAddress();
     error InvalidTokenID();
@@ -206,6 +155,8 @@ contract SwapPool is ERC1155Holder, ReentrancyGuard {
     error Unauthorized();
     error NothingToRescue();
     error CannotRescuePoolTokens();
+    error AlreadyInitialized();
+    error NotInitialized();
     error InsufficientLiquidity(uint256 available, uint256 required);
 
     // ─── Constructor ──────────────────────────────────────────────────────────
@@ -216,19 +167,9 @@ contract SwapPool is ERC1155Holder, ReentrancyGuard {
         PoolFactory.MarketConfig memory marketB_,
         uint256 lpFeeBps_,
         uint256 protocolFeeBps_,
-        address marketALpToken_,
-        address marketBLpToken_,
         address feeCollector_
     ) {
-        if (
-            factory_         == address(0) ||
-            marketALpToken_  == address(0) ||
-            marketBLpToken_  == address(0) ||
-            feeCollector_    == address(0)
-        ) revert ZeroAddress();
-
-        if (marketA_.marketContract == address(0) || marketB_.marketContract == address(0))
-            revert ZeroAddress();
+        if (factory_ == address(0) || feeCollector_ == address(0)) revert ZeroAddress();
         if (marketA_.tokenId == 0 || marketB_.tokenId == 0) revert InvalidTokenID();
         if (marketA_.decimals > 18 || marketB_.decimals > 18) revert InvalidDecimals();
         if (lpFeeBps_ > MAX_LP_FEE) revert FeeTooHigh();
@@ -236,74 +177,67 @@ contract SwapPool is ERC1155Holder, ReentrancyGuard {
 
         factory = PoolFactory(factory_);
 
-        // Hot-path immutables
-        marketAContract = marketA_.marketContract;
         marketATokenId  = marketA_.tokenId;
         marketADecimals = marketA_.decimals;
-
-        marketBContract = marketB_.marketContract;
         marketBTokenId  = marketB_.tokenId;
         marketBDecimals = marketB_.decimals;
 
         lpFeeBps       = lpFeeBps_;
         protocolFeeBps = protocolFeeBps_;
 
-        marketALpToken = LPToken(marketALpToken_);
-        marketBLpToken = LPToken(marketBLpToken_);
-        feeCollector   = FeeCollector(feeCollector_);
+        feeCollector = FeeCollector(feeCollector_);
+    }
 
-        // Cold metadata — written once at deploy, never read by swap/deposit/withdraw
-        marketAName = marketA_.name;
-        marketBName = marketB_.name;
+    /// @notice One-time wiring of LP tokenIds. Called by factory immediately after
+    ///         registering the two LP positions on the shared LP token.
+    function initialize(uint256 marketALpTokenId_, uint256 marketBLpTokenId_) external {
+        if (msg.sender != address(factory)) revert Unauthorized();
+        if (_initialized) revert AlreadyInitialized();
+        if (marketALpTokenId_ == 0 || marketBLpTokenId_ == 0) revert InvalidTokenID();
+        _initialized = true;
+        marketALpTokenId = marketALpTokenId_;
+        marketBLpTokenId = marketBLpTokenId_;
+        emit Initialized(marketALpTokenId_, marketBLpTokenId_);
+    }
+
+    modifier whenInitialized() {
+        if (!_initialized) revert NotInitialized();
+        _;
     }
 
     // ─── View helpers ─────────────────────────────────────────────────────────
 
-    /// @notice Total shares across both sides, normalized to 18 decimals.
-    function totalSharesNorm() public view returns (uint256) {
-        return _toNorm(Side.MARKET_A, marketABalance)
-             + _toNorm(Side.MARKET_B, marketBBalance);
+    /// @notice Current marketA-side LP rate, scaled by 1e18. Starts at 1e18.
+    function marketARate() public view returns (uint256) {
+        uint256 supply = factory.marketALpToken().totalSupply(marketALpTokenId);
+        if (supply == 0) return RATE_PRECISION;
+        return (aSideValue * RATE_PRECISION) / supply;
     }
 
-    /// @notice Combined supply of both LP tokens — unified denominator.
-    function totalLpSupply() public view returns (uint256) {
-        return marketALpToken.totalSupply() + marketBLpToken.totalSupply();
+    /// @notice Current marketB-side LP rate, scaled by 1e18. Starts at 1e18.
+    function marketBRate() public view returns (uint256) {
+        uint256 supply = factory.marketBLpToken().totalSupply(marketBLpTokenId);
+        if (supply == 0) return RATE_PRECISION;
+        return (bSideValue * RATE_PRECISION) / supply;
     }
 
-    /// @notice Total fee in basis points (LP + protocol).
     function totalFeeBps() public view returns (uint256) {
         return lpFeeBps + protocolFeeBps;
     }
 
-    /**
-     * @notice Current LP exchange rate scaled by 1e18.
-     *         Returns 1e18 when pool is empty (first deposit rate).
-     */
-    function exchangeRate() public view returns (uint256) {
-        uint256 supply = totalLpSupply();
-        if (supply == 0) return RATE_PRECISION;
-        return (totalSharesNorm() * RATE_PRECISION) / supply;
+    /// @notice Physical balance of a side's token held by this pool (normalized 18-dec).
+    function physicalBalanceNorm(Side side) public view returns (uint256) {
+        uint256 raw = IERC1155(_marketContract(side)).balanceOf(address(this), _tokenId(side));
+        return _toNorm(side, raw);
     }
 
     // ─── Fee helper ───────────────────────────────────────────────────────────
 
-    /**
-     * @notice Compute LP fee and protocol fee on a normalized amount.
-     *         Ceiling division ensures any non-zero amount with non-zero bps
-     *         pays at least 1 unit of fee, preventing fee evasion via splitting.
-     *
-     * @param normAmount   Gross normalized (18 dec) amount subject to fees
-     * @return lpFee       Normalized fee retained by the pool (auto-compounds)
-     * @return protocolFee Normalized fee transferred to FeeCollector
-     */
     function _computeFees(uint256 normAmount) internal view returns (uint256 lpFee, uint256 protocolFee) {
         uint256 totalBps = lpFeeBps + protocolFeeBps;
-        if (totalBps == 0) return (0, 0);
+        if (totalBps == 0 || normAmount == 0) return (0, 0);
 
-        // Single ceiling rounding on the combined fee — one rounding event
         uint256 totalFee = (normAmount * totalBps + FEE_DENOMINATOR - 1) / FEE_DENOMINATOR;
-
-        // Split proportionally: protocolFee gets floor, lpFee absorbs the remainder
         protocolFee = protocolFeeBps > 0 ? (totalFee * protocolFeeBps) / totalBps : 0;
         lpFee       = totalFee - protocolFee;
     }
@@ -311,212 +245,47 @@ contract SwapPool is ERC1155Holder, ReentrancyGuard {
     // ─── Deposit ──────────────────────────────────────────────────────────────
 
     /**
-     * @notice Deposit shares into the pool and receive the matching LP token.
-     *         Depositing marketA shares mints marketALpToken.
-     *         Depositing marketB shares mints marketBLpToken.
-     *
-     * @param side    Which market to deposit (MARKET_A or MARKET_B)
-     * @param amount  Raw number of ERC-1155 shares to deposit (native decimals)
+     * @notice Deposit shares and receive the matching LP token.
+     *         First deposit on a side mints LP 1:1 with the normalized amount.
      */
-    function deposit(Side side, uint256 amount) external nonReentrant returns (uint256 lpMinted) {
+    function deposit(Side side, uint256 amount)
+        external
+        nonReentrant
+        whenInitialized
+        returns (uint256 lpMinted)
+    {
         if (depositsPaused) revert DepositsPaused();
+        if (resolved) revert MarketResolved();
         if (amount == 0) revert ZeroAmount();
 
         _pullTokens(side, msg.sender, amount);
-
         uint256 normAmount = _toNorm(side, amount);
-        uint256 supply     = totalLpSupply();
 
-        if (supply == 0) {
-            lpMinted = normAmount;
-        } else {
-            lpMinted = (normAmount * supply) / totalSharesNorm();
-        }
+        uint256 supply = _lpToken(side).totalSupply(_lpTokenId(side));
+        uint256 sideValue = _sideValue(side);
 
+        lpMinted = (supply == 0)
+            ? normAmount
+            : (normAmount * supply) / sideValue;
         if (lpMinted == 0) revert DepositTooSmall();
 
-        _updateBalance(side, amount, true);
-        _lpToken(side).mint(msg.sender, lpMinted);
+        _addSideValue(side, normAmount);
+        _mintLp(side, msg.sender, lpMinted);
 
         emit Deposited(msg.sender, side, amount, lpMinted);
-    }
-
-    // ─── Withdraw ─────────────────────────────────────────────────────────────
-
-    /**
-     * @notice Burn LP tokens and receive underlying shares.
-     *
-     *         Same-side   (lpSide == receiveSide): free, no fee.
-     *         Cross-side  (lpSide != receiveSide): swap fee deducted from output,
-     *                     unless the pool is marked resolved.
-     *
-     * @param lpAmount     LP tokens to burn
-     * @param lpSide       Side of LP token to burn
-     * @param receiveSide  Side of ERC-1155 shares to receive
-     */
-    function withdrawSingleSide(
-        uint256 lpAmount,
-        Side lpSide,
-        Side receiveSide
-    ) external nonReentrant returns (uint256 sharesReceived) {
-        if (lpAmount == 0) revert ZeroAmount();
-
-        uint256 normOut = (lpAmount * totalSharesNorm()) / totalLpSupply();
-
-        _lpToken(lpSide).burn(msg.sender, lpAmount);
-
-        uint256 lpFee;
-        uint256 protocolFee;
-
-        if (lpSide == receiveSide) {
-            // ── Same-side: free ──────────────────────────────────────────────
-            uint256 rawOut = _fromNorm(receiveSide, normOut);
-            uint256 avail  = _getBalance(receiveSide);
-            if (rawOut > avail) revert InsufficientLiquidity(avail, rawOut);
-
-            _updateBalance(receiveSide, rawOut, false);
-            _pushTokens(receiveSide, msg.sender, rawOut);
-
-            sharesReceived = rawOut;
-            _flushResidualIfEmpty();
-            emit WithdrawnSingleSide(msg.sender, lpSide, receiveSide, lpAmount, rawOut, 0, 0);
-
-        } else {
-            // ── Cross-side ───────────────────────────────────────────────────
-            if (swapsPaused) revert SwapsPaused();
-
-            uint256 rawActual;
-
-            if (resolved) {
-                rawActual     = _fromNorm(receiveSide, normOut);
-                uint256 avail = _getBalance(receiveSide);
-                if (rawActual > avail) revert InsufficientLiquidity(avail, rawActual);
-                _updateBalance(receiveSide, rawActual, false);
-                _pushTokens(receiveSide, msg.sender, rawActual);
-            } else {
-                (lpFee, protocolFee)    = _computeFees(normOut);
-                uint256 normActual      = normOut - lpFee - protocolFee;
-                rawActual               = _fromNorm(receiveSide, normActual);
-                uint256 rawProtocol     = _fromNorm(receiveSide, protocolFee);
-
-                uint256 avail = _getBalance(receiveSide);
-                if (rawActual + rawProtocol > avail) revert InsufficientLiquidity(avail, rawActual + rawProtocol);
-
-                _updateBalance(receiveSide, rawActual + rawProtocol, false);
-                _pushTokens(receiveSide, msg.sender, rawActual);
-
-                if (rawProtocol > 0) {
-                    _pushTokens(receiveSide, address(feeCollector), rawProtocol);
-                    feeCollector.recordFee(_marketContract(receiveSide), _tokenId(receiveSide), rawProtocol);
-                }
-            }
-
-            sharesReceived = rawActual;
-            _flushResidualIfEmpty();
-            emit WithdrawnSingleSide(msg.sender, lpSide, receiveSide, lpAmount, rawActual, lpFee, protocolFee);
-        }
-    }
-
-    /**
-     * @notice Burn LP tokens and receive a split of same-side and cross-side shares.
-     *
-     * @param lpAmount      LP tokens to burn
-     * @param lpSide        Side of LP token to burn
-     * @param samesideBps   Fraction of gross output as same-side (e.g. 5000 = 50%)
-     */
-    function withdrawBothSides(
-        uint256 lpAmount,
-        Side lpSide,
-        uint256 samesideBps
-    ) external nonReentrant returns (uint256 samesideReceived, uint256 crosssideReceived) {
-        if (lpAmount == 0) revert ZeroAmount();
-        if (samesideBps > FEE_DENOMINATOR) revert InvalidSplit();
-
-        uint256 normGross     = (lpAmount * totalSharesNorm()) / totalLpSupply();
-        uint256 normSameside  = (normGross * samesideBps) / FEE_DENOMINATOR;
-        uint256 normCrossside = normGross - normSameside;
-
-        _lpToken(lpSide).burn(msg.sender, lpAmount);
-
-        Side sameSide  = lpSide;
-        Side crossSide = _oppositeSide(lpSide);
-
-        // Same-side: free
-        if (normSameside > 0) {
-            uint256 rawSame = _fromNorm(sameSide, normSameside);
-            uint256 avail   = _getBalance(sameSide);
-            if (rawSame > avail) revert InsufficientLiquidity(avail, rawSame);
-            _updateBalance(sameSide, rawSame, false);
-            _pushTokens(sameSide, msg.sender, rawSame);
-            samesideReceived = rawSame;
-        }
-
-        uint256 crossLpFee;
-        uint256 crossProtocolFee;
-        uint256 crossRawActual;
-
-        if (normCrossside > 0) {
-            if (swapsPaused) revert SwapsPaused();
-            uint256 avail = _getBalance(crossSide);
-
-            if (resolved) {
-                crossRawActual = _fromNorm(crossSide, normCrossside);
-                if (crossRawActual > avail) revert InsufficientLiquidity(avail, crossRawActual);
-                _updateBalance(crossSide, crossRawActual, false);
-                _pushTokens(crossSide, msg.sender, crossRawActual);
-            } else {
-                (crossLpFee, crossProtocolFee) = _computeFees(normCrossside);
-                uint256 normCrossActual   = normCrossside - crossLpFee - crossProtocolFee;
-                crossRawActual            = _fromNorm(crossSide, normCrossActual);
-                uint256 crossRawProtocol  = _fromNorm(crossSide, crossProtocolFee);
-
-                if (crossRawActual + crossRawProtocol > avail)
-                    revert InsufficientLiquidity(avail, crossRawActual + crossRawProtocol);
-
-                _updateBalance(crossSide, crossRawActual + crossRawProtocol, false);
-                _pushTokens(crossSide, msg.sender, crossRawActual);
-
-                if (crossRawProtocol > 0) {
-                    _pushTokens(crossSide, address(feeCollector), crossRawProtocol);
-                    feeCollector.recordFee(_marketContract(crossSide), _tokenId(crossSide), crossRawProtocol);
-                }
-            }
-        }
-
-        crosssideReceived = crossRawActual;
-        _flushResidualIfEmpty();
-        emit WithdrawnBothSides(msg.sender, lpSide, lpAmount, samesideReceived, crossRawActual, crossLpFee, crossProtocolFee);
-    }
-
-    /// @dev Flush any residual balance to feeCollector when the last LP exits.
-    ///      Prevents first-depositor capture of orphaned LP fees.
-    function _flushResidualIfEmpty() internal {
-        if (totalLpSupply() > 0) return;
-
-        if (marketABalance > 0) {
-            uint256 amount = marketABalance;
-            marketABalance = 0;
-            _pushTokens(Side.MARKET_A, address(feeCollector), amount);
-            feeCollector.recordFee(marketAContract, marketATokenId, amount);
-        }
-        if (marketBBalance > 0) {
-            uint256 amount = marketBBalance;
-            marketBBalance = 0;
-            _pushTokens(Side.MARKET_B, address(feeCollector), amount);
-            feeCollector.recordFee(marketBContract, marketBTokenId, amount);
-        }
     }
 
     // ─── Swap ─────────────────────────────────────────────────────────────────
 
     /**
-     * @notice Swap shares from one market to the other at 1:1 minus fee.
-     *         Normalization ensures correct exchange across different decimals.
-     *
-     * @param fromSide  Side being deposited
-     * @param sharesIn  Raw shares deposited (native decimals of fromSide)
+     * @notice Swap shares 1:1 (minus fees). LP fee accrues to the drained side's value.
      */
-    function swap(Side fromSide, uint256 sharesIn) external nonReentrant returns (uint256 sharesOut) {
+    function swap(Side fromSide, uint256 sharesIn)
+        external
+        nonReentrant
+        whenInitialized
+        returns (uint256 sharesOut)
+    {
         if (swapsPaused) revert SwapsPaused();
         if (sharesIn == 0) revert ZeroAmount();
 
@@ -526,67 +295,223 @@ contract SwapPool is ERC1155Holder, ReentrancyGuard {
         (uint256 lpFee, uint256 protocolFee) = _computeFees(normIn);
         uint256 normOut = normIn - lpFee - protocolFee;
 
-        sharesOut           = _fromNorm(toSide, normOut);
-        uint256 rawProtocol = _fromNorm(fromSide, protocolFee);
+        // Check physical liquidity on the output side
+        uint256 availableOut = physicalBalanceNorm(toSide);
+        if (normOut > availableOut) revert InsufficientLiquidity(availableOut, normOut);
 
-        uint256 toBalance = _getBalance(toSide);
-        if (sharesOut > toBalance) revert InsufficientLiquidity(toBalance, sharesOut);
-
+        // Pull input tokens
         _pullTokens(fromSide, msg.sender, sharesIn);
 
+        // Protocol fee (paid in input-side tokens)
+        uint256 rawProtocol = _fromNorm(fromSide, protocolFee);
         if (rawProtocol > 0) {
             _pushTokens(fromSide, address(feeCollector), rawProtocol);
             feeCollector.recordFee(_marketContract(fromSide), _tokenId(fromSide), rawProtocol);
         }
 
-        _pushTokens(toSide, msg.sender, sharesOut);
+        // Output tokens to swapper
+        uint256 rawOut = _fromNorm(toSide, normOut);
+        _pushTokens(toSide, msg.sender, rawOut);
 
-        // LP fee stays in fromSide balance: add (sharesIn - rawProtocol)
-        _updateBalance(fromSide, sharesIn - rawProtocol, true);
-        _updateBalance(toSide, sharesOut, false);
+        // LP fee accrues to the drained side's value (their reserves were used)
+        _addSideValue(toSide, lpFee);
 
-        emit Swapped(msg.sender, fromSide, sharesIn, sharesOut, lpFee, protocolFee);
+        sharesOut = rawOut;
+        emit Swapped(msg.sender, fromSide, sharesIn, rawOut, lpFee, protocolFee);
+    }
+
+    // ─── Withdrawal (swaps must be active) ────────────────────────────────────
+
+    /**
+     * @notice Withdraw LP position. User chooses which side to receive payout in.
+     *
+     *         Same-side:  no fee (except JIT fee on fresh LP portion when not resolved).
+     *         Cross-side: full fee on claim when not resolved, free when resolved.
+     *
+     *         Reverts if the pool doesn't have enough physical tokens on the chosen side.
+     *         When insufficient, user should try the other side or wait for resolution.
+     */
+    function withdrawal(Side receiveSide, uint256 lpAmount, Side lpSide)
+        external
+        nonReentrant
+        whenInitialized
+        returns (uint256 received)
+    {   
+        if (swapsPaused) revert SwapsPaused(); // should use withdrawProRata
+        if (lpAmount == 0) revert ZeroAmount();
+
+        uint256 shares = _lpToShares(lpSide, lpAmount);
+
+        uint256 lpFee;
+        uint256 protocolFee;
+
+        if (receiveSide == lpSide) {
+            // Same-side: JIT fee on fresh portion only
+            uint256 freshBurned = _freshConsumedForBurn(lpSide, lpAmount);
+            if (!resolved && freshBurned > 0) {
+                // feeBase is a part of LP that was not on wallet long enough
+                uint256 feeBase = (shares * freshBurned) / lpAmount; 
+                (lpFee, protocolFee) = _computeFees(feeBase);
+            }
+        } else {
+            // Cross-side: fee on full claim when not resolved
+            if (!resolved) {
+                (lpFee, protocolFee) = _computeFees(shares);
+            }
+        }
+
+        uint256 payout = shares - lpFee - protocolFee;
+
+        // Check physical liquidity on the receive side
+        uint256 available = physicalBalanceNorm(receiveSide);
+        uint256 totalOutflow = payout + protocolFee; // both leave the pool in receiveSide tokens
+        if (totalOutflow > available) revert InsufficientLiquidity(available, totalOutflow);
+
+        // Update value: LP fee moves to other side is cross-side
+        if (receiveSide == lpSide) {
+            // Same-side: fee stays with remaining LPs on this side
+            _subSideValue(lpSide, shares - lpFee);
+        } else {
+            // Cross-side: fee goes to the drained side (like a swap)
+            _subSideValue(lpSide, shares);
+            _addSideValue(receiveSide, lpFee);
+        }
+
+        // Burn LP tokens (triggers LPToken's fresh bucket bookkeeping)
+        _burnLp(lpSide, msg.sender, lpAmount);
+
+        // Transfer payout
+        uint256 rawPayout = _fromNorm(receiveSide, payout);
+        if (rawPayout > 0) _pushTokens(receiveSide, msg.sender, rawPayout);
+
+        // Transfer protocol fee
+        uint256 rawProto = _fromNorm(receiveSide, protocolFee);
+        if (rawProto > 0) {
+            _pushTokens(receiveSide, address(feeCollector), rawProto);
+            feeCollector.recordFee(_marketContract(receiveSide), _tokenId(receiveSide), rawProto);
+        }
+
+        received = rawPayout;
+        _flushResidualIfEmpty();
+        emit Withdrawn(msg.sender, lpSide, receiveSide, lpAmount, rawPayout, lpFee, protocolFee);
+    }
+
+    // ─── Withdrawal Pro-Rata (swaps must be paused) ───────────────────────────
+
+    /**
+     * @notice Withdraw LP position with proportional split of native and cross tokens.
+     *         Only available when swaps are paused (to prevent one side draining
+     *         the other). Never charges fees.
+     *
+     *         Native share = (lpAmount / totalSideSupply) × physicalNative,
+     *         capped at the user's full claim. Remainder paid in cross-side tokens.
+     *          
+     */
+    function withdrawProRata(uint256 lpAmount, Side lpSide)
+        external
+        nonReentrant
+        whenInitialized
+        returns (uint256 nativeOut, uint256 crossOut)
+    {
+        if (!swapsPaused) revert SwapsNotPaused(); // should use withdraw
+        if (lpAmount == 0) revert ZeroAmount();
+
+        uint256 shares = _lpToShares(lpSide, lpAmount);
+
+        Side nativeSide = lpSide;
+        Side crossSide  = _oppositeSide(lpSide);
+
+        // Proportional share of native reserves (prevents draining)
+        uint256 totalSupply = _lpToken(lpSide).totalSupply(_lpTokenId(lpSide));
+        uint256 availableNative = physicalBalanceNorm(nativeSide);
+        uint256 nativeShare = (lpAmount * availableNative) / totalSupply;
+
+        // Cap at claim — if no shortage, user gets everything in native
+        if (nativeShare > shares) nativeShare = shares;
+        uint256 crossShare = shares - nativeShare;
+
+        // Check cross-side liquidity for the remainder. It shoul never be the case
+        if (crossShare > 0) {
+            uint256 availableCross = physicalBalanceNorm(crossSide);
+            if (crossShare > availableCross) revert InsufficientLiquidity(availableCross, crossShare);
+        }
+
+        // Update value
+        _subSideValue(lpSide, shares);
+
+        // Burn LP tokens
+        _burnLp(lpSide, msg.sender, lpAmount);
+
+        // Transfer native portion
+        uint256 rawNative = _fromNorm(nativeSide, nativeShare);
+        if (rawNative > 0) _pushTokens(nativeSide, msg.sender, rawNative);
+
+        // Transfer cross portion
+        uint256 rawCross = _fromNorm(crossSide, crossShare);
+        if (rawCross > 0) _pushTokens(crossSide, msg.sender, rawCross);
+
+        nativeOut = rawNative;
+        crossOut  = rawCross;
+        _flushResidualIfEmpty();
+        emit WithdrawnProRata(msg.sender, lpSide, lpAmount, rawNative, rawCross);
+    }
+
+    // ─── Flush residual ───────────────────────────────────────────────────────
+
+    /// @dev When all LP tokens are burned, sweep any rounding dust to the fee collector.
+    function _flushResidualIfEmpty() internal {
+        uint256 aSupply = factory.marketALpToken().totalSupply(marketALpTokenId);
+        uint256 bSupply = factory.marketBLpToken().totalSupply(marketBLpTokenId);
+        if (aSupply + bSupply > 0) return;
+
+        aSideValue = 0;
+        bSideValue = 0;
+
+        uint256 rawA = IERC1155(_marketContract(Side.MARKET_A))
+            .balanceOf(address(this), marketATokenId);
+        uint256 rawB = IERC1155(_marketContract(Side.MARKET_B))
+            .balanceOf(address(this), marketBTokenId);
+
+        if (rawA > 0) {
+            _pushTokens(Side.MARKET_A, address(feeCollector), rawA);
+            feeCollector.recordFee(_marketContract(Side.MARKET_A), marketATokenId, rawA);
+        }
+        if (rawB > 0) {
+            _pushTokens(Side.MARKET_B, address(feeCollector), rawB);
+            feeCollector.recordFee(_marketContract(Side.MARKET_B), marketBTokenId, rawB);
+        }
     }
 
     // ─── Admin ────────────────────────────────────────────────────────────────
 
-    /// @notice Pause or unpause deposits. Called by factory. Operator or owner.
     function setDepositsPaused(bool paused_) external {
         if (msg.sender != address(factory)) revert Unauthorized();
         depositsPaused = paused_;
         emit DepositsPausedSet(paused_);
     }
 
-    /// @notice Pause or unpause swaps. Called by factory. Operator or owner.
     function setSwapsPaused(bool paused_) external {
         if (msg.sender != address(factory)) revert Unauthorized();
         swapsPaused = paused_;
         emit SwapsPausedSet(paused_);
     }
 
-    /// @notice Mark pool as resolved and pause deposits. Cross-side withdrawals become fee-free.
-    ///         Call once the underlying prediction market event has settled.
-    ///         Called by factory. Operator or owner.
-    function setResolvedAndPausedDeposits() external {
+    function setResolved(bool resolved_) external {
         if (msg.sender != address(factory)) revert Unauthorized();
-        if (resolved) revert AlreadyResolved();
+        resolved = resolved_;
+        emit Resolved(resolved_);
+    }
+
+    function setResolvedAndPaused() external {
+        if (msg.sender != address(factory)) revert Unauthorized();
         resolved = true;
         depositsPaused = true;
-        emit Resolved(resolved);
-        emit DepositsPausedSet(depositsPaused);
+        swapsPaused = true;
+        emit Resolved(true);
+        emit DepositsPausedSet(true);
+        emit SwapsPausedSet(true);
     }
 
-    /// @notice Unmark pool as resolved. In case it was resolved by mistake.
-    ///         Called by factory. Operator or owner.
-    function unsetResolved() external {
-        if (msg.sender != address(factory)) revert Unauthorized();
-        if (!resolved) revert NotResolved();
-        resolved = false;
-        emit Resolved(resolved);
-    }
-
-    /// @notice Update LP and protocol fee rates. Capped by MAX_LP_FEE and MAX_PROTOCOL_FEE.
-    ///         Called by factory. Owner only.
     function setFees(uint256 lpFeeBps_, uint256 protocolFeeBps_) external {
         if (msg.sender != address(factory)) revert Unauthorized();
         if (lpFeeBps_ > MAX_LP_FEE) revert FeeTooHigh();
@@ -598,37 +523,33 @@ contract SwapPool is ERC1155Holder, ReentrancyGuard {
 
     // ─── Rescue ───────────────────────────────────────────────────────────────
 
-    /// @notice Recover surplus pool tokens sent directly without using deposit().
-    ///         Only the untracked surplus above the pool's accounting is rescuable.
-    ///         LP holder funds are never at risk.
-    ///         Called by factory. Owner only.
+    /// @notice Rescue surplus pool tokens (sent accidentally, above tracked value).
     function rescueTokens(Side side, uint256 amount, address to) external {
         if (msg.sender != address(factory)) revert Unauthorized();
         if (to == address(0)) revert ZeroAddress();
 
-        uint256 tracked = _getBalance(side);
-        uint256 actual  = IERC1155(_marketContract(side)).balanceOf(address(this), _tokenId(side));
-        uint256 surplus = actual - tracked;
+        uint256 physical = physicalBalanceNorm(side);
+        uint256 tracked  = aSideValue + bSideValue;
+        // Conservative: entire tracked value could theoretically be on this side
+        // Only allow rescue if physical clearly exceeds what could be owed
+        if (amount == 0 || physical <= tracked) revert NothingToRescue();
+        uint256 surplus = physical - tracked;
         if (amount > surplus) revert NothingToRescue();
 
-        _pushTokens(side, to, amount);
+        _pushTokens(side, to, _fromNorm(side, amount));
         emit TokensRescued(side, amount, to);
     }
 
-    /// @notice Recover any other ERC-1155 token accidentally sent to this contract.
-    ///         Reverts if the contract address is either of the pool's own market contracts.
-    ///         Called by factory. Owner only.
     function rescueERC1155(address contractAddress_, uint256 tokenId_, uint256 amount, address to) external {
         if (msg.sender != address(factory)) revert Unauthorized();
         if (to == address(0)) revert ZeroAddress();
-        if (contractAddress_ == marketAContract || contractAddress_ == marketBContract)
-            revert CannotRescuePoolTokens();
+        address mktA = _marketContract(Side.MARKET_A);
+        address mktB = _marketContract(Side.MARKET_B);
+        if (contractAddress_ == mktA || contractAddress_ == mktB) revert CannotRescuePoolTokens();
         IERC1155(contractAddress_).safeTransferFrom(address(this), to, tokenId_, amount, "");
         emit ERC1155Rescued(contractAddress_, tokenId_, amount, to);
     }
 
-    /// @notice Recover any ERC-20 token accidentally sent to this contract.
-    ///         Called by factory. Owner only.
     function rescueERC20(address token, uint256 amount, address to) external {
         if (msg.sender != address(factory)) revert Unauthorized();
         if (to == address(0)) revert ZeroAddress();
@@ -636,8 +557,6 @@ contract SwapPool is ERC1155Holder, ReentrancyGuard {
         emit ERC20Rescued(token, amount, to);
     }
 
-    /// @notice Recover ETH accidentally sent to this contract.
-    ///         Called by factory. Owner only.
     function rescueETH(address payable to) external {
         if (msg.sender != address(factory)) revert Unauthorized();
         if (to == address(0)) revert ZeroAddress();
@@ -650,6 +569,68 @@ contract SwapPool is ERC1155Holder, ReentrancyGuard {
     receive() external payable {}
 
     // ─── Internal helpers ─────────────────────────────────────────────────────
+
+    /// @notice Normalized share amount attributed to the given LP token amount.
+    function _lpToShares(Side lpSide, uint256 lpAmount) internal view returns (uint256) {
+        uint256 rate = (lpSide == Side.MARKET_A) ? marketARate() : marketBRate();
+        return (lpAmount * rate) / RATE_PRECISION;
+    }
+
+    /// @notice Portion of `lpAmount` attributable to the caller's fresh (locked) bucket.
+    ///         Matured LP is consumed first by the LPToken's outflow hook, so the fee
+    ///         base is only the overhang — i.e., max(0, lpAmount − matured).
+    function _freshConsumedForBurn(Side lpSide, uint256 lpAmount) internal view returns (uint256) {
+        LPToken lp = _lpToken(lpSide);
+        uint256 tokenId = _lpTokenId(lpSide);
+        uint256 balance = lp.balanceOf(msg.sender, tokenId);
+        uint256 locked  = lp.lockedAmount(msg.sender, tokenId);
+        uint256 matured = balance > locked ? balance - locked : 0;
+        return lpAmount > matured ? lpAmount - matured : 0;
+    }
+
+    function _burnLp(Side lpSide, address from, uint256 amount) internal {
+        if (lpSide == Side.MARKET_A) {
+            factory.marketALpToken().burn(from, marketALpTokenId, amount);
+        } else {
+            factory.marketBLpToken().burn(from, marketBLpTokenId, amount);
+        }
+    }
+
+    function _mintLp(Side lpSide, address to, uint256 amount) internal {
+        if (lpSide == Side.MARKET_A) {
+            factory.marketALpToken().mint(to, marketALpTokenId, amount);
+        } else {
+            factory.marketBLpToken().mint(to, marketBLpTokenId, amount);
+        }
+    }
+
+    function _sideValue(Side side) internal view returns (uint256) {
+        return side == Side.MARKET_A ? aSideValue : bSideValue;
+    }
+
+    function _addSideValue(Side side, uint256 amount) internal {
+        if (side == Side.MARKET_A) {
+            aSideValue += amount;
+        } else {
+            bSideValue += amount;
+        }
+    }
+
+    function _subSideValue(Side side, uint256 amount) internal {
+        if (side == Side.MARKET_A) {
+            aSideValue -= amount;
+        } else {
+            bSideValue -= amount;
+        }
+    }
+
+    function _lpToken(Side side) internal view returns (LPToken) {
+        return side == Side.MARKET_A ? factory.marketALpToken() : factory.marketBLpToken();
+    }
+
+    function _lpTokenId(Side side) internal view returns (uint256) {
+        return side == Side.MARKET_A ? marketALpTokenId : marketBLpTokenId;
+    }
 
     function _toNorm(Side side, uint256 raw) internal view returns (uint256) {
         uint8 dec = side == Side.MARKET_A ? marketADecimals : marketBDecimals;
@@ -671,28 +652,12 @@ contract SwapPool is ERC1155Holder, ReentrancyGuard {
         IERC1155(_marketContract(side)).safeTransferFrom(address(this), to, _tokenId(side), amount, "");
     }
 
-    function _updateBalance(Side side, uint256 amount, bool add) internal {
-        if (side == Side.MARKET_A) {
-            marketABalance = add ? marketABalance + amount : marketABalance - amount;
-        } else {
-            marketBBalance = add ? marketBBalance + amount : marketBBalance - amount;
-        }
-    }
-
-    function _getBalance(Side side) internal view returns (uint256) {
-        return side == Side.MARKET_A ? marketABalance : marketBBalance;
-    }
-
     function _oppositeSide(Side side) internal pure returns (Side) {
         return side == Side.MARKET_A ? Side.MARKET_B : Side.MARKET_A;
     }
 
-    function _lpToken(Side side) internal view returns (LPToken) {
-        return side == Side.MARKET_A ? marketALpToken : marketBLpToken;
-    }
-
     function _marketContract(Side side) internal view returns (address) {
-        return side == Side.MARKET_A ? marketAContract : marketBContract;
+        return side == Side.MARKET_A ? factory.marketAContract() : factory.marketBContract();
     }
 
     function _tokenId(Side side) internal view returns (uint256) {

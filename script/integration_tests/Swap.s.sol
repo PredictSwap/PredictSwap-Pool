@@ -37,23 +37,24 @@ contract Swap is Script {
         SwapPool pool = SwapPool(payable(info.swapPool));
         SwapPool.Side fromSide = SwapPool.Side(sideRaw);
 
-        // Resolve contracts and token IDs — live on pool, not factory
-        address fromToken = fromSide == SwapPool.Side.MARKET_A ? pool.marketAContract() : pool.marketBContract();
-        address toToken   = fromSide == SwapPool.Side.MARKET_A ? pool.marketBContract() : pool.marketAContract();
+        // Resolve contracts and token IDs — market contracts live on factory, tokenIds on pool
+        SwapPool.Side toSide = fromSide == SwapPool.Side.MARKET_A ? SwapPool.Side.MARKET_B : SwapPool.Side.MARKET_A;
+        address fromToken = fromSide == SwapPool.Side.MARKET_A ? factory.marketAContract() : factory.marketBContract();
+        address toToken   = fromSide == SwapPool.Side.MARKET_A ? factory.marketBContract() : factory.marketAContract();
         uint256 fromId    = fromSide == SwapPool.Side.MARKET_A ? pool.marketATokenId()  : pool.marketBTokenId();
         uint256 toId      = fromSide == SwapPool.Side.MARKET_A ? pool.marketBTokenId()  : pool.marketATokenId();
 
-        string memory fromName = fromSide == SwapPool.Side.MARKET_A ? info.marketA.name : info.marketB.name;
-        string memory toName   = fromSide == SwapPool.Side.MARKET_A ? info.marketB.name : info.marketA.name;
+        string memory fromName = fromSide == SwapPool.Side.MARKET_A ? factory.marketAName() : factory.marketBName();
+        string memory toName   = fromSide == SwapPool.Side.MARKET_A ? factory.marketBName() : factory.marketAName();
 
-        // Expected output — fees read from pool, computed in normalized space.
-        // This is an approximation for display only; exact value computed on-chain.
+        // Expected output — approximation for display only; exact value computed on-chain.
         uint256 totalFeeBps = pool.lpFeeBps() + pool.protocolFeeBps();
         uint256 expectedOut = amountIn - (amountIn * totalFeeBps / pool.FEE_DENOMINATOR());
 
         uint256 fromBalance = IERC1155(fromToken).balanceOf(sender, fromId);
         uint256 toBalance   = IERC1155(toToken).balanceOf(sender, toId);
-        uint256 poolToLiq   = fromSide == SwapPool.Side.MARKET_A ? pool.marketBBalance() : pool.marketABalance();
+        // Physical liquidity on the OUTPUT side — this is the drained side that serves the swap.
+        uint256 poolToLiq   = pool.physicalBalanceNorm(toSide);
 
         console.log("=== Swap ===");
         console.log("Pool ID:           ", poolId);

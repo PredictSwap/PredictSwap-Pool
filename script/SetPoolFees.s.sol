@@ -39,8 +39,10 @@ contract SetPoolFees is Script {
         console.log("Factory:              ", factoryAddr);
         console.log("Pool ID:              ", poolId);
         console.log("SwapPool:             ", info.swapPool);
-        console.log("Market A:             ", info.marketA.name);
-        console.log("Market B:             ", info.marketB.name);
+        console.log("Market A:             ", factory.marketAName());
+        console.log("Market B:             ", factory.marketBName());
+        console.log("Market A tokenId:     ", info.marketA.tokenId);
+        console.log("Market B tokenId:     ", info.marketB.tokenId);
         console.log("Current LP fee:       ", pool.lpFeeBps(), "bps");
         console.log("Current protocol fee: ", pool.protocolFeeBps(), "bps");
         console.log("New LP fee:           ", lpFee, "bps");
