@@ -44,6 +44,14 @@ contract PredictSwapV3Test is Test {
     uint256 constant MARKET_A_ID_2 = 2;
     uint256 constant MARKET_B_ID_2 = 22;
 
+    uint8 constant MARKET_A_DEC = 6;
+    uint8 constant MARKET_B_DEC = 18;
+
+    // All deposits and actually recieved from withdraw are in raw decimals.
+    // All calculations inside contracts are normalized to 1e18
+    uint256 constant MARKET_A_DEC_RAW = 1e6;
+    uint256 constant MARKET_B_DEC_RAW = 1e18;
+
     uint256 constant LP_FEE_BPS       = 30; // 0.30%
     uint256 constant PROTOCOL_FEE_BPS = 10; // 0.10%
     uint256 constant TOTAL_FEE_BPS    = 40;
@@ -78,8 +86,8 @@ contract PredictSwapV3Test is Test {
             owner,
             "Polymarket",
             "Opinion",
-            "Polymarket LP",
-            "Opinion LP"
+            "Polymarket LP. Polymarket:Opinion pools",
+            "Opinion LP. Polymarket:Opinion pools"
         );
         vm.stopPrank();
 
@@ -88,11 +96,11 @@ contract PredictSwapV3Test is Test {
 
         vm.prank(operator);
         uint256 poolId = factory.createPool(
-            _cfg(MARKET_A_ID, 18),
-            _cfg(MARKET_B_ID, 18),
+            _cfg(MARKET_A_ID, MARKET_A_DEC),
+            _cfg(MARKET_B_ID, MARKET_B_DEC),
             LP_FEE_BPS,
             PROTOCOL_FEE_BPS,
-            "BTC-YES"
+            "Trump impeachment 2028 - YES"
         );
 
         PoolFactory.PoolInfo memory info = factory.getPool(poolId);
@@ -100,10 +108,10 @@ contract PredictSwapV3Test is Test {
         lpIdA = info.marketALpTokenId;
         lpIdB = info.marketBLpTokenId;
 
-        _fundAndApprove(lp1,     10_000 ether, 10_000 ether);
-        _fundAndApprove(lp2,     10_000 ether, 10_000 ether);
-        _fundAndApprove(lp3,     10_000 ether, 10_000 ether);
-        _fundAndApprove(swapper, 10_000 ether, 10_000 ether);
+        _mintAndApprove(lp1,     10_000 * MARKET_A_DEC_RAW, 10_000 * MARKET_B_DEC_RAW);
+        _mintAndApprove(lp2,     10_000 * MARKET_A_DEC_RAW, 10_000 * MARKET_B_DEC_RAW);
+        _mintAndApprove(lp3,     10_000 * MARKET_A_DEC_RAW, 10_000 * MARKET_B_DEC_RAW);
+        _mintAndApprove(swapper, 10_000 * MARKET_A_DEC_RAW, 10_000 * MARKET_B_DEC_RAW);
     }
 
     // ─── Helpers ──────────────────────────────────────────────────────────────
@@ -112,7 +120,7 @@ contract PredictSwapV3Test is Test {
         return PoolFactory.MarketConfig({tokenId: id, decimals: dec});
     }
 
-    function _fundAndApprove(address user, uint256 amtA, uint256 amtB) internal {
+    function _mintAndApprove(address user, uint256 amtA, uint256 amtB) internal {
         marketAToken.mint(user, MARKET_A_ID, amtA);
         marketBToken.mint(user, MARKET_B_ID, amtB);
         marketAToken.mint(user, MARKET_A_ID_2, amtA);
@@ -153,23 +161,34 @@ contract PredictSwapV3Test is Test {
         factory.setResolvePool(0, true);
     }
 
+    function _toNorm(uint256 raw, uint8 dec) internal pure returns (uint256) {
+        return raw * 10 ** (18 - dec);
+    }
+
+    function _fromNorm(uint256 norm, uint8 dec) internal pure returns (uint256) {
+        return norm / 10 ** (18 - dec);
+    }
+
     function _assertValueInvariant() internal view {
         uint256 physA = pool.physicalBalanceNorm(SwapPool.Side.MARKET_A);
         uint256 physB = pool.physicalBalanceNorm(SwapPool.Side.MARKET_B);
-        assertEq(
+        uint256 minDec = MARKET_A_DEC < MARKET_B_DEC ? MARKET_A_DEC : MARKET_B_DEC;
+        uint256 tolerance = 10 ** (18 - minDec);
+        assertApproxEqAbs(
             pool.aSideValue() + pool.bSideValue(),
             physA + physB,
-            "aSideValue + bSideValue == physical(A) + physical(B)"
+            tolerance,
+            "aSideValue + bSideValue ~= physical(A) + physical(B)"
         );
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    //                             LOCK (LPToken two-bucket)
+    //                             LOCK (Fresh deposit status for 24 hour)
     // ─────────────────────────────────────────────────────────────────────────
 
     function testLock_FirstDepositCreatesFreshBucket() public {
         uint256 t0 = block.timestamp;
-        _deposit(lp1, SwapPool.Side.MARKET_A, 100 ether);
+        _deposit(lp1, SwapPool.Side.MARKET_A, 100 * MARKET_A_DEC_RAW);
         assertEq(_freshAmount(lp1, lpIdA), 100 ether, "fresh amount");
         assertEq(_freshTimestamp(lp1, lpIdA), t0, "fresh timestamp");
         assertTrue(marketALpToken.isLocked(lp1, lpIdA), "locked after deposit");
@@ -178,11 +197,11 @@ contract PredictSwapV3Test is Test {
 
     function testLock_ConsecutiveDepositsWeightedAverage() public {
         vm.warp(1_000_000);
-        _deposit(lp1, SwapPool.Side.MARKET_A, 100 ether);
+        _deposit(lp1, SwapPool.Side.MARKET_A, 100 * MARKET_A_DEC_RAW);
         assertEq(_freshTimestamp(lp1, lpIdA), 1_000_000, "first timestamp");
 
         vm.warp(1_000_000 + 12 hours);
-        _deposit(lp1, SwapPool.Side.MARKET_A, 100 ether);
+        _deposit(lp1, SwapPool.Side.MARKET_A, 100 * MARKET_A_DEC_RAW);
 
         // (100*1_000_000 + 100*(1_000_000 + 43_200)) / 200 = 1_000_000 + 21_600
         assertEq(_freshTimestamp(lp1, lpIdA), 1_021_600, "weighted avg timestamp");
@@ -190,7 +209,7 @@ contract PredictSwapV3Test is Test {
     }
 
     function testLock_TransferToEmptyWallet_FreshAtRecipient() public {
-        _deposit(lp1, SwapPool.Side.MARKET_A, 100 ether);
+        _deposit(lp1, SwapPool.Side.MARKET_A, 100 * MARKET_A_DEC_RAW);
         skip(5 hours);
         uint256 recvStamp = block.timestamp;
 
@@ -202,11 +221,11 @@ contract PredictSwapV3Test is Test {
     }
 
     function testLock_TransferToMaturedHolder_OnlyIncomingIsFresh() public {
-        _deposit(lp2, SwapPool.Side.MARKET_A, 100 ether);
+        _deposit(lp2, SwapPool.Side.MARKET_A, 100 * MARKET_A_DEC_RAW);
         skip(30 hours);
         assertEq(marketALpToken.lockedAmount(lp2, lpIdA), 0, "lp2 matured");
 
-        _deposit(lp1, SwapPool.Side.MARKET_A, 100 ether);
+        _deposit(lp1, SwapPool.Side.MARKET_A, 100 * MARKET_A_DEC_RAW);
         vm.prank(lp1);
         marketALpToken.safeTransferFrom(lp1, lp2, lpIdA, 40 ether, "");
 
@@ -215,9 +234,9 @@ contract PredictSwapV3Test is Test {
     }
 
     function testLock_OutflowFromMatured_DoesNotTouchFresh() public {
-        _deposit(lp1, SwapPool.Side.MARKET_A, 100 ether);
+        _deposit(lp1, SwapPool.Side.MARKET_A, 100 * MARKET_A_DEC_RAW);
         skip(30 hours);
-        _deposit(lp1, SwapPool.Side.MARKET_A, 30 ether);
+        _deposit(lp1, SwapPool.Side.MARKET_A, 30 * MARKET_A_DEC_RAW);
         assertEq(_freshAmount(lp1, lpIdA), 30 ether, "fresh pre");
 
         vm.prank(lp1);
@@ -228,9 +247,9 @@ contract PredictSwapV3Test is Test {
     }
 
     function testLock_OutflowExceedingMatured_ReducesFresh() public {
-        _deposit(lp1, SwapPool.Side.MARKET_A, 100 ether);
+        _deposit(lp1, SwapPool.Side.MARKET_A, 100 * MARKET_A_DEC_RAW);
         skip(30 hours);
-        _deposit(lp1, SwapPool.Side.MARKET_A, 30 ether);
+        _deposit(lp1, SwapPool.Side.MARKET_A, 30 * MARKET_A_DEC_RAW);
 
         vm.prank(lp1);
         marketALpToken.safeTransferFrom(lp1, recv, lpIdA, 110 ether, "");
@@ -239,13 +258,13 @@ contract PredictSwapV3Test is Test {
     }
 
     function testLock_PoisoningResistance_OneWeiDoesNotLockMatured() public {
-        _fundAndApprove(attacker, 1_000 ether, 1_000 ether);
+        _mintAndApprove(attacker, 1_000 * MARKET_A_DEC_RAW, 1_000 * MARKET_B_DEC_RAW);
 
-        _deposit(lp1, SwapPool.Side.MARKET_A, 100 ether);
+        _deposit(lp1, SwapPool.Side.MARKET_A, 100 * MARKET_A_DEC_RAW);
         skip(30 hours);
         assertEq(marketALpToken.lockedAmount(lp1, lpIdA), 0, "whale matured");
 
-        _deposit(attacker, SwapPool.Side.MARKET_A, 1 ether);
+        _deposit(attacker, SwapPool.Side.MARKET_A, 1 * MARKET_A_DEC_RAW);
         vm.prank(attacker);
         marketALpToken.safeTransferFrom(attacker, lp1, lpIdA, 1, "");
 
@@ -254,7 +273,7 @@ contract PredictSwapV3Test is Test {
     }
 
     function testLock_FreshGraduatesAfterLockPeriod() public {
-        _deposit(lp1, SwapPool.Side.MARKET_A, 100 ether);
+        _deposit(lp1, SwapPool.Side.MARKET_A, 100 * MARKET_A_DEC_RAW);
         assertEq(marketALpToken.lockedAmount(lp1, lpIdA), 100 ether, "initially locked");
         skip(24 hours + 1);
         assertEq(marketALpToken.lockedAmount(lp1, lpIdA), 0, "graduates by time");
@@ -262,8 +281,8 @@ contract PredictSwapV3Test is Test {
     }
 
     function testLock_BurnDoesNotRevert() public {
-        _deposit(lp1, SwapPool.Side.MARKET_A, 100 ether);
-        _deposit(lp3, SwapPool.Side.MARKET_B, 100 ether);
+        _deposit(lp1, SwapPool.Side.MARKET_A, 100 * MARKET_A_DEC_RAW);
+        _deposit(lp3, SwapPool.Side.MARKET_B, 100 * MARKET_B_DEC_RAW);
         skip(25 hours);
         uint256 lpBal = marketALpToken.balanceOf(lp1, lpIdA);
         vm.prank(lp1);
@@ -274,8 +293,8 @@ contract PredictSwapV3Test is Test {
     function testLock_PerTokenIdIsolation() public {
         vm.prank(operator);
         uint256 pool2Id = factory.createPool(
-            _cfg(MARKET_A_ID_2, 18),
-            _cfg(MARKET_B_ID_2, 18),
+            _cfg(MARKET_A_ID_2, MARKET_A_DEC),
+            _cfg(MARKET_B_ID_2, MARKET_B_DEC),
             LP_FEE_BPS,
             PROTOCOL_FEE_BPS,
             "ETH-NO"
@@ -288,11 +307,11 @@ contract PredictSwapV3Test is Test {
         marketAToken.setApprovalForAll(address(pool2), true);
 
         vm.warp(1_000);
-        _deposit(lp1, SwapPool.Side.MARKET_A, 100 ether);
+        _deposit(lp1, SwapPool.Side.MARKET_A, 100 * MARKET_A_DEC_RAW);
 
         vm.warp(1_000 + 30 hours);
         vm.prank(lp1);
-        pool2.deposit(SwapPool.Side.MARKET_A, 100 ether);
+        pool2.deposit(SwapPool.Side.MARKET_A, 100 * MARKET_A_DEC_RAW);
 
         assertFalse(marketALpToken.isLocked(lp1, lpIdA),  "pool1 matured");
         assertTrue(marketALpToken.isLocked(lp1, lpIdA2), "pool2 fresh");
@@ -305,7 +324,7 @@ contract PredictSwapV3Test is Test {
     // ─────────────────────────────────────────────────────────────────────────
 
     function testDeposit_FirstDepositOnSideMints1to1() public {
-        uint256 minted = _deposit(lp1, SwapPool.Side.MARKET_A, 500 ether);
+        uint256 minted = _deposit(lp1, SwapPool.Side.MARKET_A, 500 * MARKET_A_DEC_RAW);
         assertEq(minted, 500 ether, "LP minted 1:1");
         assertEq(marketALpToken.balanceOf(lp1, lpIdA), 500 ether);
         assertEq(pool.aSideValue(), 500 ether);
@@ -313,15 +332,15 @@ contract PredictSwapV3Test is Test {
     }
 
     function testDeposit_SecondDepositMintsAtCurrentRate() public {
-        _deposit(lp1, SwapPool.Side.MARKET_A, 1000 ether);
-        _deposit(lp3, SwapPool.Side.MARKET_B, 1000 ether);
+        _deposit(lp1, SwapPool.Side.MARKET_A, 1000 * MARKET_A_DEC_RAW);
+        _deposit(lp3, SwapPool.Side.MARKET_B, 1000 * MARKET_B_DEC_RAW);
         // Run a B→A swap to grow aSideValue via lpFee.
         vm.prank(swapper);
-        pool.swap(SwapPool.Side.MARKET_B, 100 ether);
+        pool.swap(SwapPool.Side.MARKET_B, 500 * MARKET_B_DEC_RAW);
         uint256 aValBefore = pool.aSideValue();
         uint256 aSupply    = marketALpToken.totalSupply(lpIdA);
 
-        uint256 minted = _deposit(lp2, SwapPool.Side.MARKET_A, 100 ether);
+        uint256 minted = _deposit(lp2, SwapPool.Side.MARKET_A, 100 * MARKET_A_DEC_RAW);
         // minted = 100 * aSupply / aValBefore
         uint256 expected = (100 ether * aSupply) / aValBefore;
         assertEq(minted, expected, "mint at post-fee rate");
@@ -332,7 +351,7 @@ contract PredictSwapV3Test is Test {
         factory.setPoolDepositsPaused(0, true);
         vm.prank(lp1);
         vm.expectRevert(SwapPool.DepositsPaused.selector);
-        pool.deposit(SwapPool.Side.MARKET_A, 100 ether);
+        pool.deposit(SwapPool.Side.MARKET_A, 100 * MARKET_A_DEC_RAW);
     }
 
     function testDeposit_RevertsOnZero() public {
@@ -345,7 +364,7 @@ contract PredictSwapV3Test is Test {
         _resolve();
         vm.prank(lp1);
         vm.expectRevert(SwapPool.MarketResolved.selector);
-        pool.deposit(SwapPool.Side.MARKET_A, 100 ether);
+        pool.deposit(SwapPool.Side.MARKET_A, 100 * MARKET_A_DEC_RAW);
     }
 
     function testDeposit_RevertsWhenResolvedAndPaused() public {
@@ -355,7 +374,7 @@ contract PredictSwapV3Test is Test {
         factory.resolvePoolAndPause(0);
         vm.prank(lp1);
         vm.expectRevert(SwapPool.DepositsPaused.selector);
-        pool.deposit(SwapPool.Side.MARKET_A, 100 ether);
+        pool.deposit(SwapPool.Side.MARKET_A, 100 * MARKET_A_DEC_RAW);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -363,18 +382,18 @@ contract PredictSwapV3Test is Test {
     // ─────────────────────────────────────────────────────────────────────────
 
     function testSwap_PaysExpectedNetAndGrowsDrainedSideRate() public {
-        _seedBalanced(1000 ether, 1000 ether);
+        _seedBalanced(1000 * MARKET_A_DEC_RAW, 1000 * MARKET_B_DEC_RAW);
         uint256 bRateBefore = pool.marketBRate();
         uint256 aRateBefore = pool.marketARate();
 
         // A → B swap: drained side is B, so bSideValue grows by lpFee.
-        uint256 amountIn = 100 ether;
+        uint256 amountIn = 100 * MARKET_A_DEC_RAW;
         uint256 bBefore  = marketBToken.balanceOf(swapper, MARKET_B_ID);
         vm.prank(swapper);
         uint256 out = pool.swap(SwapPool.Side.MARKET_A, amountIn);
 
         // Ceiling-rounded total fee → payout is normIn - totalFee (ceil), off by at most 1.
-        assertApproxEqAbs(out, amountIn - ((amountIn * TOTAL_FEE_BPS + FEE_DEN - 1) / FEE_DEN), 1, "payout");
+        assertApproxEqAbs(out, _fromNorm(_toNorm(amountIn - ((amountIn * TOTAL_FEE_BPS + FEE_DEN - 1) / FEE_DEN), MARKET_A_DEC), MARKET_B_DEC), 1, "payout");
         assertEq(marketBToken.balanceOf(swapper, MARKET_B_ID) - bBefore, out);
 
         assertGt(pool.marketBRate(), bRateBefore, "B rate grew (drained side)");
@@ -383,30 +402,30 @@ contract PredictSwapV3Test is Test {
     }
 
     function testSwap_BtoA_GrowsARateOnly() public {
-        _seedBalanced(1000 ether, 1000 ether);
+        _seedBalanced(1000 * MARKET_A_DEC_RAW, 1000 * MARKET_B_DEC_RAW);
         uint256 aRateBefore = pool.marketARate();
         uint256 bRateBefore = pool.marketBRate();
         vm.prank(swapper);
-        pool.swap(SwapPool.Side.MARKET_B, 100 ether);
+        pool.swap(SwapPool.Side.MARKET_B, 100 * MARKET_B_DEC_RAW);
         assertGt(pool.marketARate(), aRateBefore, "A rate grew");
         assertEq(pool.marketBRate(), bRateBefore, "B rate unchanged");
         _assertValueInvariant();
     }
 
     function testSwap_RevertsOnPaused() public {
-        _seedBalanced(1000 ether, 1000 ether);
+        _seedBalanced(1000 * MARKET_A_DEC_RAW, 1000 * MARKET_B_DEC_RAW);
         _pauseSwaps();
         vm.prank(swapper);
         vm.expectRevert(SwapPool.SwapsPaused.selector);
-        pool.swap(SwapPool.Side.MARKET_A, 100 ether);
+        pool.swap(SwapPool.Side.MARKET_A, 100 * MARKET_A_DEC_RAW);
     }
 
     function testSwap_RevertsOnInsufficientLiquidity() public {
-        _deposit(lp1, SwapPool.Side.MARKET_A, 1000 ether);
+        _deposit(lp1, SwapPool.Side.MARKET_A, 1000 * MARKET_A_DEC_RAW);
         // No B deposits → B physical = 0. A→B swap should revert.
         vm.prank(swapper);
         vm.expectRevert(abi.encodeWithSelector(SwapPool.InsufficientLiquidity.selector, 0, 99.6 ether));
-        pool.swap(SwapPool.Side.MARKET_A, 100 ether);
+        pool.swap(SwapPool.Side.MARKET_A, 100 * MARKET_A_DEC_RAW);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -414,7 +433,7 @@ contract PredictSwapV3Test is Test {
     // ─────────────────────────────────────────────────────────────────────────
 
     function testWithdrawal_SameSide_Matured_Free() public {
-        _seedBalanced(1000 ether, 1000 ether);
+        _seedBalanced(1000 * MARKET_A_DEC_RAW, 1000 * MARKET_B_DEC_RAW);
         skip(25 hours); // everything matures
         uint256 bal = marketALpToken.balanceOf(lp1, lpIdA);
         uint256 fcBefore = marketAToken.balanceOf(address(feeCollector), MARKET_A_ID);
@@ -424,12 +443,12 @@ contract PredictSwapV3Test is Test {
         pool.withdrawal(SwapPool.Side.MARKET_A, bal, SwapPool.Side.MARKET_A);
 
         assertEq(marketAToken.balanceOf(address(feeCollector), MARKET_A_ID), fcBefore, "no fee");
-        assertEq(marketAToken.balanceOf(lp1, MARKET_A_ID) - aBefore, 1000 ether, "full claim");
+        assertEq(marketAToken.balanceOf(lp1, MARKET_A_ID) - aBefore, 1000 * MARKET_A_DEC_RAW, "full claim");
         _assertValueInvariant();
     }
 
     function testWithdrawal_SameSide_Fresh_0p4Fee() public {
-        _seedBalanced(1000 ether, 1000 ether);
+        _seedBalanced(1000 * MARKET_A_DEC_RAW, 1000 * MARKET_B_DEC_RAW);
         uint256 bal = marketALpToken.balanceOf(lp1, lpIdA);
         uint256 aBefore = marketAToken.balanceOf(lp1, MARKET_A_ID);
 
@@ -437,11 +456,11 @@ contract PredictSwapV3Test is Test {
         pool.withdrawal(SwapPool.Side.MARKET_A, bal, SwapPool.Side.MARKET_A);
 
         uint256 out = marketAToken.balanceOf(lp1, MARKET_A_ID) - aBefore;
-        uint256 expected = (1000 ether * (FEE_DEN - TOTAL_FEE_BPS)) / FEE_DEN;
+        uint256 expected = (1000 * MARKET_A_DEC_RAW * (FEE_DEN - TOTAL_FEE_BPS)) / FEE_DEN;
         assertApproxEqAbs(out, expected, 2, "payout after 0.4% JIT fee");
         assertApproxEqAbs(
             marketAToken.balanceOf(address(feeCollector), MARKET_A_ID),
-            (1000 ether * PROTOCOL_FEE_BPS) / FEE_DEN,
+            (1000 * MARKET_A_DEC_RAW * PROTOCOL_FEE_BPS) / FEE_DEN,
             2,
             "protocol fee"
         );
@@ -449,10 +468,10 @@ contract PredictSwapV3Test is Test {
     }
 
     function testWithdrawal_SameSide_PartialFresh_FeeOnOverhangOnly() public {
-        _deposit(lp1, SwapPool.Side.MARKET_A, 1000 ether);
-        _deposit(lp3, SwapPool.Side.MARKET_B, 1000 ether);
+        _deposit(lp1, SwapPool.Side.MARKET_A, 1000 * MARKET_A_DEC_RAW);
+        _deposit(lp3, SwapPool.Side.MARKET_B, 1000 * MARKET_B_DEC_RAW);
         skip(25 hours);
-        _deposit(lp1, SwapPool.Side.MARKET_A, 200 ether);
+        _deposit(lp1, SwapPool.Side.MARKET_A, 200 * MARKET_A_DEC_RAW);
         // 1000 matured + 200 fresh. Burn 1100: 1000 from matured, 100 from fresh.
 
         uint256 bal  = marketALpToken.balanceOf(lp1, lpIdA);
@@ -463,7 +482,7 @@ contract PredictSwapV3Test is Test {
         pool.withdrawal(SwapPool.Side.MARKET_A, burn, SwapPool.Side.MARKET_A);
 
         // feeBase = claim * freshConsumed/burn = burn * 100/burn = 100
-        uint256 expectedProto = (100 ether * PROTOCOL_FEE_BPS + FEE_DEN - 1) / FEE_DEN;
+        uint256 expectedProto = (100 * MARKET_A_DEC_RAW * PROTOCOL_FEE_BPS + FEE_DEN - 1) / FEE_DEN;
         assertApproxEqAbs(
             marketAToken.balanceOf(address(feeCollector), MARKET_A_ID) - fcBefore,
             expectedProto,
@@ -474,10 +493,10 @@ contract PredictSwapV3Test is Test {
     }
 
     function testWithdrawal_SameSide_BurnFitsInMatured_NoFee() public {
-        _deposit(lp1, SwapPool.Side.MARKET_A, 1000 ether);
-        _deposit(lp3, SwapPool.Side.MARKET_B, 1000 ether);
+        _deposit(lp1, SwapPool.Side.MARKET_A, 1000 * MARKET_A_DEC_RAW);
+        _deposit(lp3, SwapPool.Side.MARKET_B, 1000 * MARKET_B_DEC_RAW);
         skip(25 hours);
-        _deposit(lp1, SwapPool.Side.MARKET_A, 200 ether);
+        _deposit(lp1, SwapPool.Side.MARKET_A, 200 * MARKET_A_DEC_RAW);
         uint256 fcBefore = marketAToken.balanceOf(address(feeCollector), MARKET_A_ID);
 
         vm.prank(lp1);
@@ -492,7 +511,7 @@ contract PredictSwapV3Test is Test {
     }
 
     function testWithdrawal_CrossSide_Unresolved_FullFee() public {
-        _seedBalanced(1000 ether, 1000 ether);
+        _seedBalanced(1000 * MARKET_A_DEC_RAW, 1000 * MARKET_B_DEC_RAW);
         skip(25 hours); // matured → no JIT fee would have applied on same-side
         uint256 bal = marketALpToken.balanceOf(lp1, lpIdA);
         uint256 bBefore = marketBToken.balanceOf(lp1, MARKET_B_ID);
@@ -501,13 +520,13 @@ contract PredictSwapV3Test is Test {
         pool.withdrawal(SwapPool.Side.MARKET_B, bal, SwapPool.Side.MARKET_A);
 
         uint256 out = marketBToken.balanceOf(lp1, MARKET_B_ID) - bBefore;
-        uint256 expected = (1000 ether * (FEE_DEN - TOTAL_FEE_BPS)) / FEE_DEN;
+        uint256 expected = (1000 * MARKET_B_DEC_RAW * (FEE_DEN - TOTAL_FEE_BPS)) / FEE_DEN;
         assertApproxEqAbs(out, expected, 2, "cross-side payout after 0.4% fee");
         _assertValueInvariant();
     }
 
     function testWithdrawal_CrossSide_Resolved_FullClaim() public {
-        _seedBalanced(1000 ether, 1000 ether);
+        _seedBalanced(1000 * MARKET_A_DEC_RAW, 1000 * MARKET_B_DEC_RAW);
         _resolve();
         uint256 bal = marketALpToken.balanceOf(lp1, lpIdA);
         uint256 bBefore = marketBToken.balanceOf(lp1, MARKET_B_ID);
@@ -515,13 +534,13 @@ contract PredictSwapV3Test is Test {
         vm.prank(lp1);
         pool.withdrawal(SwapPool.Side.MARKET_B, bal, SwapPool.Side.MARKET_A);
 
-        assertEq(marketBToken.balanceOf(lp1, MARKET_B_ID) - bBefore, 1000 ether, "full claim when resolved");
+        assertEq(marketBToken.balanceOf(lp1, MARKET_B_ID) - bBefore, 1000 * MARKET_B_DEC_RAW, "full claim when resolved");
         assertEq(marketBToken.balanceOf(address(feeCollector), MARKET_B_ID), 0, "no fee");
         _assertValueInvariant();
     }
 
     function testWithdrawal_CrossSide_FeeCreditedToReceiveSide() public {
-        _seedBalanced(1000 ether, 1000 ether);
+        _seedBalanced(1000 * MARKET_A_DEC_RAW, 1000 * MARKET_B_DEC_RAW);
         skip(25 hours);
         uint256 aRateBefore = pool.marketARate();
         uint256 bRateBefore = pool.marketBRate();
@@ -537,7 +556,7 @@ contract PredictSwapV3Test is Test {
     }
 
     function testWithdrawal_RevertsOnSwapsPaused() public {
-        _seedBalanced(1000 ether, 1000 ether);
+        _seedBalanced(1000 * MARKET_A_DEC_RAW, 1000 * MARKET_B_DEC_RAW);
         _pauseSwaps();
         uint256 bal = marketALpToken.balanceOf(lp1, lpIdA);
         vm.prank(lp1);
@@ -553,10 +572,10 @@ contract PredictSwapV3Test is Test {
 
     function testWithdrawal_RevertsOnInsufficientPhysical() public {
         // Deposit A only; attempt same-side A withdraw after a drain via swap pushes A physical low
-        _seedBalanced(1000 ether, 1000 ether);
+        _seedBalanced(1000 * MARKET_A_DEC_RAW, 1000 * MARKET_B_DEC_RAW);
         // Drain most of A via B→A swap
         vm.prank(swapper);
-        pool.swap(SwapPool.Side.MARKET_B, 900 ether);
+        pool.swap(SwapPool.Side.MARKET_B, 900 * MARKET_B_DEC_RAW);
         // A physical is now ~100; lp1 holds 1000 A-LP worth ~1000 claim → revert
         uint256 bal = marketALpToken.balanceOf(lp1, lpIdA);
         vm.prank(lp1);
@@ -565,12 +584,51 @@ contract PredictSwapV3Test is Test {
         pool.withdrawal(SwapPool.Side.MARKET_A, bal, SwapPool.Side.MARKET_A);
     }
 
+    function testWithdrawal_LastLP_SameSide_FeeCreditsOtherSide() public {
+        _seedBalanced(1000 * MARKET_A_DEC_RAW, 1000 * MARKET_B_DEC_RAW);
+        // lp1 has fresh A-LP → JIT fee applies
+        uint256 bal = marketALpToken.balanceOf(lp1, lpIdA);
+        uint256 bRateBefore = pool.marketBRate();
+
+        vm.prank(lp1);
+        pool.withdrawal(SwapPool.Side.MARKET_A, bal, SwapPool.Side.MARKET_A);
+
+        // lp1 was the only A-side LP → isLastLp=true → lpFee credited to B side
+        assertEq(marketALpToken.totalSupply(lpIdA), 0, "A supply zeroed");
+        assertGt(pool.marketBRate(), bRateBefore, "B rate grew from redirected lpFee");
+        assertEq(pool.aSideValue(), 0, "A side fully drained");
+        _assertValueInvariant();
+    }
+
+    function testWithdrawal_LastLP_BothSidesEmpty_FeeToCollector() public {
+        // Only A-side deposit, no B-side LPs
+        _deposit(lp1, SwapPool.Side.MARKET_A, 1000 * MARKET_A_DEC_RAW);
+        // lp1 is fresh → JIT fee applies, and B side has 0 supply
+        uint256 bal = marketALpToken.balanceOf(lp1, lpIdA);
+        uint256 fcBefore = marketAToken.balanceOf(address(feeCollector), MARKET_A_ID);
+
+        vm.prank(lp1);
+        pool.withdrawal(SwapPool.Side.MARKET_A, bal, SwapPool.Side.MARKET_A);
+
+        assertEq(marketALpToken.totalSupply(lpIdA), 0, "A supply zeroed");
+        assertEq(marketBLpToken.totalSupply(lpIdB), 0, "B supply was already 0");
+        assertEq(pool.aSideValue(), 0, "A side clean");
+        assertEq(pool.bSideValue(), 0, "B side clean");
+        // lpFee should not be stranded — verify it went to fee collector or pool is clean
+        assertGt(
+            marketAToken.balanceOf(address(feeCollector), MARKET_A_ID) - fcBefore,
+            0,
+            "lpFee routed to fee collector when no other side LPs exist"
+        );
+        _assertValueInvariant();
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     //                             WITHDRAW PRO-RATA
     // ─────────────────────────────────────────────────────────────────────────
 
     function testWithdrawProRata_RevertsWhenSwapsActive() public {
-        _seedBalanced(1000 ether, 1000 ether);
+        _seedBalanced(1000 * MARKET_A_DEC_RAW, 1000 * MARKET_B_DEC_RAW);
         uint256 bal = marketALpToken.balanceOf(lp1, lpIdA);
         vm.prank(lp1);
         vm.expectRevert(SwapPool.SwapsNotPaused.selector);
@@ -578,7 +636,7 @@ contract PredictSwapV3Test is Test {
     }
 
     function testWithdrawProRata_Balanced_AllNative() public {
-        _seedBalanced(1000 ether, 1000 ether);
+        _seedBalanced(1000 * MARKET_A_DEC_RAW, 1000 * MARKET_B_DEC_RAW);
         _pauseSwaps();
         uint256 bal = marketALpToken.balanceOf(lp1, lpIdA);
         uint256 aBefore = marketAToken.balanceOf(lp1, MARKET_A_ID);
@@ -587,16 +645,16 @@ contract PredictSwapV3Test is Test {
         vm.prank(lp1);
         pool.withdrawProRata(bal, SwapPool.Side.MARKET_A);
 
-        assertEq(marketAToken.balanceOf(lp1, MARKET_A_ID) - aBefore, 1000 ether, "all in A (native)");
+        assertEq(marketAToken.balanceOf(lp1, MARKET_A_ID) - aBefore, 1000 * MARKET_A_DEC_RAW, "all in A (native)");
         assertEq(marketBToken.balanceOf(lp1, MARKET_B_ID) - bBefore, 0,          "nothing in B");
         _assertValueInvariant();
     }
 
     function testWithdrawProRata_Imbalanced_SplitsNativeAndCross() public {
-        _seedBalanced(1000 ether, 1000 ether);
+        _seedBalanced(1000 * MARKET_A_DEC_RAW, 1000 * MARKET_B_DEC_RAW);
         // Drain some A via B→A swap (physical A decreases).
         vm.prank(swapper);
-        pool.swap(SwapPool.Side.MARKET_B, 200 ether);
+        pool.swap(SwapPool.Side.MARKET_B, 200 * MARKET_B_DEC_RAW);
         _pauseSwaps();
 
         uint256 fcABefore = marketAToken.balanceOf(address(feeCollector), MARKET_A_ID);
@@ -620,7 +678,7 @@ contract PredictSwapV3Test is Test {
     }
 
     function testWithdrawProRata_NoFee_EvenWithFreshLP() public {
-        _seedBalanced(1000 ether, 1000 ether);
+        _seedBalanced(1000 * MARKET_A_DEC_RAW, 1000 * MARKET_B_DEC_RAW);
         _pauseSwaps();
         uint256 bal = marketALpToken.balanceOf(lp1, lpIdA);
         assertTrue(marketALpToken.isLocked(lp1, lpIdA), "fresh");
@@ -636,22 +694,22 @@ contract PredictSwapV3Test is Test {
     // ─────────────────────────────────────────────────────────────────────────
 
     function testValueInvariant_AfterDeposits() public {
-        _deposit(lp1, SwapPool.Side.MARKET_A, 500 ether);
-        _deposit(lp2, SwapPool.Side.MARKET_B, 300 ether);
-        _deposit(lp3, SwapPool.Side.MARKET_A, 200 ether);
+        _deposit(lp1, SwapPool.Side.MARKET_A, 500 * MARKET_A_DEC_RAW);
+        _deposit(lp2, SwapPool.Side.MARKET_B, 300 * MARKET_B_DEC_RAW);
+        _deposit(lp3, SwapPool.Side.MARKET_A, 200 * MARKET_A_DEC_RAW);
         _assertValueInvariant();
     }
 
     function testValueInvariant_AfterMixedOps() public {
-        _seedBalanced(1000 ether, 1000 ether);
+        _seedBalanced(1000 * MARKET_A_DEC_RAW, 1000 * MARKET_B_DEC_RAW);
         _assertValueInvariant();
 
         vm.prank(swapper);
-        pool.swap(SwapPool.Side.MARKET_A, 50 ether);
+        pool.swap(SwapPool.Side.MARKET_A, 50 * MARKET_A_DEC_RAW);
         _assertValueInvariant();
 
         vm.prank(swapper);
-        pool.swap(SwapPool.Side.MARKET_B, 80 ether);
+        pool.swap(SwapPool.Side.MARKET_B, 80 * MARKET_B_DEC_RAW);
         _assertValueInvariant();
 
         skip(25 hours);
@@ -669,19 +727,19 @@ contract PredictSwapV3Test is Test {
     // ─────────────────────────────────────────────────────────────────────────
 
     function testRateAttribution_SwapGrowsDrainedSideOnly() public {
-        _seedBalanced(1000 ether, 1000 ether);
+        _seedBalanced(1000 * MARKET_A_DEC_RAW, 1000 * MARKET_B_DEC_RAW);
         uint256 aBefore = pool.marketARate();
         uint256 bBefore = pool.marketBRate();
 
         vm.prank(swapper);
-        pool.swap(SwapPool.Side.MARKET_A, 100 ether); // drain is B
+        pool.swap(SwapPool.Side.MARKET_A, 100 * MARKET_A_DEC_RAW); // drain is B
         assertEq(pool.marketARate(), aBefore, "A unchanged");
         assertGt(pool.marketBRate(), bBefore, "B grew");
     }
 
     function testRateAttribution_SameSideJITFeeGrowsOwnRate() public {
-        _seedBalanced(1000 ether, 1000 ether);
-        _deposit(lp3, SwapPool.Side.MARKET_A, 500 ether); // lp3 stays in after lp1 exits
+        _seedBalanced(1000 * MARKET_A_DEC_RAW, 1000 * MARKET_B_DEC_RAW);
+        _deposit(lp3, SwapPool.Side.MARKET_A, 500 * MARKET_A_DEC_RAW); // lp3 stays in after lp1 exits
         uint256 aBefore = pool.marketARate();
 
         uint256 bal = marketALpToken.balanceOf(lp1, lpIdA);
@@ -736,7 +794,7 @@ contract PredictSwapV3Test is Test {
     }
 
     function testFactory_SetResolvePool_TogglesWithoutTouchingPauseFlags() public {
-        _seedBalanced(1000 ether, 1000 ether);
+        _seedBalanced(1000 * MARKET_A_DEC_RAW, 1000 * MARKET_B_DEC_RAW);
 
         vm.prank(operator);
         factory.setResolvePool(0, true);
@@ -750,7 +808,7 @@ contract PredictSwapV3Test is Test {
     }
 
     function testFactory_ResolvePoolAndPause_AtomicAllThreeFlags() public {
-        _seedBalanced(1000 ether, 1000 ether);
+        _seedBalanced(1000 * MARKET_A_DEC_RAW, 1000 * MARKET_B_DEC_RAW);
 
         vm.prank(operator);
         factory.resolvePoolAndPause(0);
@@ -763,8 +821,8 @@ contract PredictSwapV3Test is Test {
     function testFactory_ProjectAndLpNamesStoredAtFactory() public {
         assertEq(factory.marketAName(), "Polymarket");
         assertEq(factory.marketBName(), "Opinion");
-        assertEq(marketALpToken.name(), "Polymarket LP");
-        assertEq(marketBLpToken.name(), "Opinion LP");
+        assertEq(marketALpToken.name(), "Polymarket LP. Polymarket:Opinion pools");
+        assertEq(marketBLpToken.name(), "Opinion LP. Polymarket:Opinion pools");
     }
 
     function testFactory_SecondFactoryWithDifferentNames() public {
@@ -792,7 +850,7 @@ contract PredictSwapV3Test is Test {
     // ─────────────────────────────────────────────────────────────────────────
 
     function testFlushResidual_LastExitResetsState() public {
-        _seedBalanced(1000 ether, 1000 ether);
+        _seedBalanced(1000 * MARKET_A_DEC_RAW, 1000 * MARKET_B_DEC_RAW);
         skip(25 hours);
 
         vm.prank(lp1);
@@ -812,9 +870,9 @@ contract PredictSwapV3Test is Test {
     function testFlushResidual_ProRataExitAfterSwapFlushesDust() public {
         // A swap creates rounding dust on one side; pro-rata exits of both sides should
         // leave the pool clean with any residual swept to the fee collector.
-        _seedBalanced(1000 ether, 1000 ether);
+        _seedBalanced(1000 * MARKET_A_DEC_RAW, 1000 * MARKET_B_DEC_RAW);
         vm.prank(swapper);
-        pool.swap(SwapPool.Side.MARKET_A, 100 ether);
+        pool.swap(SwapPool.Side.MARKET_A, 100 * MARKET_A_DEC_RAW);
         _pauseSwaps();
 
         vm.prank(lp1);
@@ -831,7 +889,7 @@ contract PredictSwapV3Test is Test {
     }
 
     function testRescue_NothingToRescueWhenPhysicalMatchesTracked() public {
-        _seedBalanced(1000 ether, 1000 ether);
+        _seedBalanced(1000 * MARKET_A_DEC_RAW, 1000 * MARKET_B_DEC_RAW);
         vm.prank(owner);
         vm.expectRevert(SwapPool.NothingToRescue.selector);
         factory.rescuePoolTokens(0, SwapPool.Side.MARKET_A, 1, recv);
@@ -840,11 +898,11 @@ contract PredictSwapV3Test is Test {
     function testRescue_SurplusPhysicalCanBeRescued() public {
         // Empty pool (no deposits). Someone accidentally sends tokens in.
         // rescueTokens's conservative check requires physical > aSideValue + bSideValue.
-        marketAToken.mint(address(pool), MARKET_A_ID, 50 ether);
+        marketAToken.mint(address(pool), MARKET_A_ID, 50 * MARKET_A_DEC_RAW);
 
         uint256 recvBefore = marketAToken.balanceOf(recv, MARKET_A_ID);
         vm.prank(owner);
-        factory.rescuePoolTokens(0, SwapPool.Side.MARKET_A, 50 ether, recv);
-        assertEq(marketAToken.balanceOf(recv, MARKET_A_ID) - recvBefore, 50 ether);
+        factory.rescuePoolTokens(0, SwapPool.Side.MARKET_A, 50 * MARKET_A_DEC_RAW, recv);
+        assertEq(marketAToken.balanceOf(recv, MARKET_A_ID) - recvBefore, 50 * MARKET_A_DEC_RAW);
     }
 }

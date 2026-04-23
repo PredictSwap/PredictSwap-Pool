@@ -152,6 +152,7 @@ contract SwapPool is ERC1155Holder, ReentrancyGuard {
     error InvalidDecimals();
     error FeeTooHigh();
     error DepositTooSmall();
+    error SwapTooSmall();
     error Unauthorized();
     error NothingToRescue();
     error CannotRescuePoolTokens();
@@ -311,6 +312,7 @@ contract SwapPool is ERC1155Holder, ReentrancyGuard {
 
         // Output tokens to swapper
         uint256 rawOut = _fromNorm(toSide, normOut);
+        if (rawOut == 0) revert SwapTooSmall(); // or a new ZeroOutput error
         _pushTokens(toSide, msg.sender, rawOut);
 
         // LP fee accrues to the drained side's value (their reserves were used)
@@ -369,10 +371,18 @@ contract SwapPool is ERC1155Holder, ReentrancyGuard {
 
         // Update value: LP fee moves to other side is cross-side
         if (receiveSide == lpSide) {
-            // Same-side: fee stays with remaining LPs on this side
-            _subSideValue(lpSide, shares - lpFee);
+            uint256 supplyBefore = _lpToken(lpSide).totalSupply(_lpTokenId(lpSide));
+            bool isLastLp = (supplyBefore == lpAmount);
+            
+            if (isLastLp && lpFee > 0) {
+                // No remaining same-side LPs to benefit from the fee.
+                // Credit it to the other side (they now effectively own the residual).
+                _subSideValue(lpSide, shares);
+                _addSideValue(_oppositeSide(lpSide), lpFee);
+            } else {
+                _subSideValue(lpSide, shares - lpFee);
+            }
         } else {
-            // Cross-side: fee goes to the drained side (like a swap)
             _subSideValue(lpSide, shares);
             _addSideValue(receiveSide, lpFee);
         }
@@ -524,20 +534,19 @@ contract SwapPool is ERC1155Holder, ReentrancyGuard {
     // ─── Rescue ───────────────────────────────────────────────────────────────
 
     /// @notice Rescue surplus pool tokens (sent accidentally, above tracked value).
-    function rescueTokens(Side side, uint256 amount, address to) external {
+    function rescueTokens(Side side, uint256 rawAmount, address to) external {
         if (msg.sender != address(factory)) revert Unauthorized();
         if (to == address(0)) revert ZeroAddress();
 
         uint256 physical = physicalBalanceNorm(side);
         uint256 tracked  = aSideValue + bSideValue;
-        // Conservative: entire tracked value could theoretically be on this side
-        // Only allow rescue if physical clearly exceeds what could be owed
-        if (amount == 0 || physical <= tracked) revert NothingToRescue();
-        uint256 surplus = physical - tracked;
-        if (amount > surplus) revert NothingToRescue();
+        uint256 normAmount = _toNorm(side, rawAmount);
 
-        _pushTokens(side, to, _fromNorm(side, amount));
-        emit TokensRescued(side, amount, to);
+        if (normAmount == 0 || physical <= tracked) revert NothingToRescue();
+        uint256 surplus = physical - tracked;
+        if (normAmount > surplus) revert NothingToRescue();
+        _pushTokens(side, to, rawAmount);
+        emit TokensRescued(side, normAmount, to);
     }
 
     function rescueERC1155(address contractAddress_, uint256 tokenId_, uint256 amount, address to) external {
