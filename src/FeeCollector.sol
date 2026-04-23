@@ -71,12 +71,27 @@ contract FeeCollector is Ownable, ERC1155Holder {
     ///         Token IDs with zero balance are silently skipped.
     function withdrawAllBatch(address token, uint256[] calldata tokenIds, address to) external onlyOwner {
         if (to == address(0)) revert ZeroAddress();
-        uint256[] memory amounts = new uint256[](tokenIds.length);
+
+        // First pass: count non-zero entries
+        uint256 count;
         for (uint256 i; i < tokenIds.length; i++) {
-            amounts[i] = IERC1155(token).balanceOf(address(this), tokenIds[i]);
-            if (amounts[i] == 0) continue; // skip zero-balance IDs silently
-            emit FeeWithdrawn(token, tokenIds[i], amounts[i], to);
+            if (IERC1155(token).balanceOf(address(this), tokenIds[i]) > 0) count++;
         }
-        IERC1155(token).safeBatchTransferFrom(address(this), to, tokenIds, amounts, "");
+        if (count == 0) revert ZeroAmount();
+
+        // Second pass: build compact arrays
+        uint256[] memory ids = new uint256[](count);
+        uint256[] memory amounts = new uint256[](count);
+        uint256 j;
+        for (uint256 i; i < tokenIds.length; i++) {
+            uint256 bal = IERC1155(token).balanceOf(address(this), tokenIds[i]);
+            if (bal == 0) continue;
+            ids[j] = tokenIds[i];
+            amounts[j] = bal;
+            emit FeeWithdrawn(token, tokenIds[i], bal, to);
+            j++;
+        }
+
+        IERC1155(token).safeBatchTransferFrom(address(this), to, ids, amounts, "");
     }
 }

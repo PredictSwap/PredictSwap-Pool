@@ -288,6 +288,7 @@ contract SwapPool is ERC1155Holder, ReentrancyGuard {
         returns (uint256 sharesOut)
     {
         if (swapsPaused) revert SwapsPaused();
+        if (resolved) revert MarketResolved();
         if (sharesIn == 0) revert ZeroAmount();
 
         Side toSide = _oppositeSide(fromSide);
@@ -392,7 +393,8 @@ contract SwapPool is ERC1155Holder, ReentrancyGuard {
 
         // Transfer payout
         uint256 rawPayout = _fromNorm(receiveSide, payout);
-        if (rawPayout > 0) _pushTokens(receiveSide, msg.sender, rawPayout);
+        if (rawPayout == 0) revert ZeroAmount();
+        _pushTokens(receiveSide, msg.sender, rawPayout);
 
         // Transfer protocol fee
         uint256 rawProto = _fromNorm(receiveSide, protocolFee);
@@ -452,13 +454,15 @@ contract SwapPool is ERC1155Holder, ReentrancyGuard {
         // Burn LP tokens
         _burnLp(lpSide, msg.sender, lpAmount);
 
-        // Transfer native portion
         uint256 rawNative = _fromNorm(nativeSide, nativeShare);
-        if (rawNative > 0) _pushTokens(nativeSide, msg.sender, rawNative);
-
-        // Transfer cross portion
         uint256 rawCross = _fromNorm(crossSide, crossShare);
-        if (rawCross > 0) _pushTokens(crossSide, msg.sender, rawCross);
+
+        if (rawNative == 0 && rawCross == 0) revert ZeroAmount();
+
+        // Transfer native portion
+        if (rawNative > 0) _pushTokens(nativeSide, msg.sender, rawNative);
+        // Transfer cross portion
+        if (rawCross  > 0) _pushTokens(crossSide, msg.sender, rawCross);
 
         nativeOut = rawNative;
         crossOut  = rawCross;
@@ -538,13 +542,17 @@ contract SwapPool is ERC1155Holder, ReentrancyGuard {
         if (msg.sender != address(factory)) revert Unauthorized();
         if (to == address(0)) revert ZeroAddress();
 
-        uint256 physical = physicalBalanceNorm(side);
-        uint256 tracked  = aSideValue + bSideValue;
         uint256 normAmount = _toNorm(side, rawAmount);
+        if (normAmount == 0) revert NothingToRescue();
 
-        if (normAmount == 0 || physical <= tracked) revert NothingToRescue();
-        uint256 surplus = physical - tracked;
+        // Global surplus: total physical across BOTH sides minus total obligations
+        uint256 totalPhysical = physicalBalanceNorm(Side.MARKET_A) + physicalBalanceNorm(Side.MARKET_B);
+        uint256 totalTracked  = aSideValue + bSideValue;
+        if (totalPhysical <= totalTracked) revert NothingToRescue();
+
+        uint256 surplus = totalPhysical - totalTracked;
         if (normAmount > surplus) revert NothingToRescue();
+
         _pushTokens(side, to, rawAmount);
         emit TokensRescued(side, normAmount, to);
     }
