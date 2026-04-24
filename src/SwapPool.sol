@@ -373,6 +373,10 @@ contract SwapPool is ERC1155Holder, ReentrancyGuard {
 
         uint256 supplyBefore = _lpToken(lpSide).totalSupply(_lpTokenId(lpSide));
         bool isLastLp = (supplyBefore == lpAmount);
+
+        // Burn LP tokens (triggers LPToken's fresh bucket bookkeeping)
+        _burnLp(lpSide, msg.sender, lpAmount);
+
         // Update value: LP fee moves to other side is cross-side
         if (receiveSide == lpSide) {            
             if (isLastLp && lpFee > 0) {
@@ -392,9 +396,6 @@ contract SwapPool is ERC1155Holder, ReentrancyGuard {
                 _distributeLpFee(receiveSide, lpSide, lpFee, totalOutflow);
             }
         }
-
-        // Burn LP tokens (triggers LPToken's fresh bucket bookkeeping)
-        _burnLp(lpSide, msg.sender, lpAmount);
 
         // Transfer payout
         uint256 rawPayout = _fromNorm(receiveSide, payoutNorm);
@@ -453,11 +454,12 @@ contract SwapPool is ERC1155Holder, ReentrancyGuard {
             if (crossShare > availableCross) revert InsufficientLiquidity(availableCross, crossShare);
         }
 
+        // Burn LP tokens
+        _burnLp(lpSide, msg.sender, lpAmount);
+
         // Update value
         _subSideValue(lpSide, shares);
 
-        // Burn LP tokens
-        _burnLp(lpSide, msg.sender, lpAmount);
 
         uint256 rawNative = _fromNorm(nativeSide, nativeShare);
         uint256 rawCross = _fromNorm(crossSide, crossShare);
@@ -653,17 +655,17 @@ contract SwapPool is ERC1155Holder, ReentrancyGuard {
     ///         Imagine Pool 1005:1000, but LPs are 2000:5. 
     ///         If swap 1000 A to B, all the fees goes to 5 LP, that is incorrect 
     ///         and should be targeted with this function
-    function _distributeLpFee(Side drainedSide, Side otherSide, uint256 lpFee, uint256 drain) internal {
+    function _distributeLpFee(Side drainedSide, Side fromSide, uint256 lpFee, uint256 drain) internal {
         if (lpFee == 0) return;
         uint256 drainedVal = _sideValue(drainedSide);
         if (drainedVal == 0) {
-            _addSideValue(otherSide, lpFee);
+            _addSideValue(fromSide, lpFee);
         } else if (drain <= drainedVal) {
             _addSideValue(drainedSide, lpFee);
         } else {
             uint256 feeToDrained = (lpFee * drainedVal) / drain;
             _addSideValue(drainedSide, feeToDrained);
-            _addSideValue(otherSide, lpFee - feeToDrained);
+            _addSideValue(fromSide, lpFee - feeToDrained);
         }
     }
 

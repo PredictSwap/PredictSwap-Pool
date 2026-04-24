@@ -71,6 +71,41 @@ lpFee       = totalFee - protocolFee
 
 A single ceiling rounding (not one per component) ensures the aggregate fee never exceeds one rounding unit above the configured rate, while still guaranteeing at least 1 unit of fee on any non-zero amount with non-zero bps.
 
+### Fee application examples
+
+There are 3 possible operation that requires fee payment - swap, withdraw cross-side, withdraw fresh liquidity
+
+At any time pool is balanced by as
+``` aSideValue + bSideValue == totalPoolMarketSharesA + totalPoolMarketSharesB ```
+
+SideValue might be considered as totalSideLP * LPprice as it increases with fees gathered by LPs
+
+Particular pool composition varies based on current market condition. That has direct influence on 
+the way fees are distributed to the LP holders, as in examples below
+
+#### 1. Swaps
+
+| Type                                         | Shares in pool A:B     | SideValue A:B      | Operaion        |Fees goes to |
+|----------------------------------------------|------------------------|--------------------|-----------------|-----------------|
+| sufficient liqudity providers from both sides          | 510:1000               | 750:750 | Swap 150 A -> B        | all to B LP (increase bSideValue)
+| insufficient liqudity providers on drained side          | 510:1000               | 1450:50 | Swap 900 A -> B        | both LPs. Fees from 50/900 to B LP, from 850/900 to A LP
+| no liqudity providers on drained side          | 510:1000               | 1500:0 | Swap 900 A -> B        | all to A LP as no B LP
+
+
+#### 2. Withdrawl old or fresh liquidity cross-side (Same as swaps)
+
+| Type                                         | Shares in pool A:B     | SideValue A:B      | Operaion        |Fees goes to |
+|----------------------------------------------|------------------------|--------------------|-----------------|-----------------|
+| sufficient liqudity providers from both sides          | 510:1000               | 750:750 | A side LP withdraw 150 B shares       | all to B LP 
+| insufficient liqudity providers on drained side          | 510:1000               | 1450:50 | A side LP withdraw 900 B shares        | both LPs. Fees from 50/900 to B LP, from 850/900 to A LP
+| no liqudity providers on drained side          | 510:1000               | 1500:0 | Swap 900 A -> B        | all to A LP as no B LP          | 510:1000               | 1500:0 | A side LP withdraw 900 B shares        | all to A LP as no B LP
+
+
+#### 3. Withdrawl fresh liquidity same-side
+| Type                                         | Shares in pool A:B     | SideValue A:B      | Operaion        |Fees goes to |
+|----------------------------------------------|------------------------|--------------------|-----------------|-----------------|
+| sufficient liqudity providers from both sides          | 510:1000               | 750:750 | A side LP withdraw 150 A shares        | all to A LP 
+| last LP withdraw          | 510:1000               | 500:1000 | user is the last LP on side A and withdraw side A fully        | all to B LP 
 ---
 
 ## Withdrawals
