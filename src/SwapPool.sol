@@ -316,8 +316,9 @@ contract SwapPool is ERC1155Holder, ReentrancyGuard {
         if (rawOut == 0) revert SwapTooSmall(); // or a new ZeroOutput error
         _pushTokens(toSide, msg.sender, rawOut);
 
-        // LP fee accrues to the drained side's value (their reserves were used)
-        _addSideValue(toSide, lpFee);
+        // LP fee split: drained-side LPs get fee proportional to their
+        // value; any drain beyond their value used the other side's overflow.
+        _distributeLpFee(toSide, fromSide, lpFee, normOut);
 
         sharesOut = rawOut;
         emit Swapped(msg.sender, fromSide, sharesIn, rawOut, lpFee, protocolFee);
@@ -363,11 +364,11 @@ contract SwapPool is ERC1155Holder, ReentrancyGuard {
             }
         }
 
-        uint256 payout = shares - lpFee - protocolFee;
+        uint256 payoutNorm = shares - lpFee - protocolFee;
 
         // Check physical liquidity on the receive side
         uint256 available = physicalBalanceNorm(receiveSide);
-        uint256 totalOutflow = payout + protocolFee; // both leave the pool in receiveSide tokens
+        uint256 totalOutflow = payoutNorm + protocolFee; // both leave the pool in receiveSide tokens
         if (totalOutflow > available) revert InsufficientLiquidity(available, totalOutflow);
 
         // Update value: LP fee moves to other side is cross-side
@@ -385,14 +386,14 @@ contract SwapPool is ERC1155Holder, ReentrancyGuard {
             }
         } else {
             _subSideValue(lpSide, shares);
-            _addSideValue(receiveSide, lpFee);
+            _distributeLpFee(receiveSide, lpSide, lpFee, totalOutflow);
         }
 
         // Burn LP tokens (triggers LPToken's fresh bucket bookkeeping)
         _burnLp(lpSide, msg.sender, lpAmount);
 
         // Transfer payout
-        uint256 rawPayout = _fromNorm(receiveSide, payout);
+        uint256 rawPayout = _fromNorm(receiveSide, payoutNorm);
         if (rawPayout == 0) revert ZeroAmount();
         _pushTokens(receiveSide, msg.sender, rawPayout);
 
@@ -638,6 +639,26 @@ contract SwapPool is ERC1155Holder, ReentrancyGuard {
             aSideValue -= amount;
         } else {
             bSideValue -= amount;
+        }
+    }
+
+    /// @notice Split LP fee between drained side and the other side based on
+    ///         effective liquidity ownership. If the drain exceeds the drained
+    ///         side's LP value, the excess was backed by the other side's overflow.
+    ///         Imagine Pool 1005:1000, but LPs are 2000:5. 
+    ///         If swap 1000 A to B, all the fees goes to 5 LP, that is incorrect 
+    ///         and should be targeted with this function
+    function _distributeLpFee(Side drainedSide, Side otherSide, uint256 lpFee, uint256 drain) internal {
+        if (lpFee == 0) return;
+        uint256 drainedVal = _sideValue(drainedSide);
+        if (drainedVal == 0) {
+            _addSideValue(otherSide, lpFee);
+        } else if (drain <= drainedVal) {
+            _addSideValue(drainedSide, lpFee);
+        } else {
+            uint256 feeToDrained = (lpFee * drainedVal) / drain;
+            _addSideValue(drainedSide, feeToDrained);
+            _addSideValue(otherSide, lpFee - feeToDrained);
         }
     }
 
